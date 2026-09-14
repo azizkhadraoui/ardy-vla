@@ -1,0 +1,23 @@
+# local environment (copy of env.sh.example, machine-specific paths and HF_TOKEN)
+env.sh
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# run outputs
+runs/
+libero_hdf5/
+LIBERO/
+*.log
+slurm-*.out
+logs/
+
+# os / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

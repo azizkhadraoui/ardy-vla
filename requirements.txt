@@ -1,0 +1,16 @@
+# python 3.11 recommended (robosuite 1.4 + mujoco 3.1.6 wheels exist for 3.10-3.12)
+torch>=2.2            # pip install torch --index-url https://download.pytorch.org/whl/cu121
+transformers>=4.40
+huggingface_hub
+sentencepiece
+h5py
+imageio[ffmpeg]
+matplotlib
+pillow
+scipy
+numpy
+mujoco==3.1.6
+robosuite==1.4.1
+bddl
+easydict
+cloudpickle
