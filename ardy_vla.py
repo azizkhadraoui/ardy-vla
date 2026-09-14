@@ -91,6 +91,137 @@ def log(*a):
     print(time.strftime("[%H:%M:%S]"), *a, flush=True)
 
 
+# ============================================================================ weights & biases
+# Opt-in: WANDB=1 in env.sh. Every helper below is a no-op when it is off, when the package is missing, or when
+# anything inside wandb raises -- a logging failure must never take down a 2.6 h evaluation. Compute nodes without
+# outbound network should set WANDB_MODE=offline and `wandb sync $WORK_DIR/wandb/offline-*` from the login node.
+WANDB = os.environ.get("WANDB", "0") == "1"
+WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "ardy-vla")
+WANDB_ENTITY = os.environ.get("WANDB_ENTITY") or None
+WANDB_GROUP = os.environ.get("WANDB_GROUP") or None        # default group: the variant, so its seeds sit together
+_wb = None            # the module, once imported
+_wb_run = None
+_wb_quiet = False     # set after the first failed log, so a broken run does not print 30k warnings
+
+
+def wandb_id(variant, seed):
+    """One run per checkpoint. Stages 3/4/5 all attach to the same id, so a variant's training curve, its open-loop
+    adherence and its closed-loop success live on one run instead of three that have to be joined by hand."""
+    return re.sub(r"[^A-Za-z0-9_.-]", "-", f"{variant}_s{seed}" + ("" if PRESET == "long" else f"_{PRESET}"))
+
+
+def wandb_init(job_type, variant=None, seed=None, config=None, name=None):
+    """Start (or re-attach to) the run for this stage. Returns the run, or None when logging is off."""
+    global _wb, _wb_run, _wb_quiet
+    wandb_finish()
+    if not WANDB:
+        return None
+    try:
+        import wandb
+    except ImportError:
+        log("WANDB=1 but the wandb package is not installed (pip install wandb); continuing without it")
+        return None
+    try:
+        cfg = dict(preset=PRESET, suites=SUITES, encoder=ENCODER, d_model=D_MODEL, layers=LAYERS, steps=STEPS,
+                   batch=BATCH, lr=LR, cond_drop=COND_DROP, w_goal=W_GOAL, w_body=W_BODY, w_consist=W_CONSIST,
+                   patch=P, chunk=C, hist=H, fut=FUT, max_goals=MAX_GOALS, t_diff=T_DIFF, sample_steps=SAMPLE_STEPS,
+                   goal_cfg=GOAL_CFG, guide_scale=GUIDE_SCALE, tok_levels=LEVELS, tok_groups=G, tok_steps=TOK_STEPS,
+                   slurm_job=os.environ.get("SLURM_JOB_ID"), slurm_array=os.environ.get("SLURM_ARRAY_TASK_ID"),
+                   gpu=torch.cuda.get_device_name(0) if DEVICE == "cuda" else "cpu", torch_version=torch.__version__)
+        if variant is not None:
+            cfg["variant"] = variant
+            cfg.update({f"v_{k}": v for k, v in VARIANTS.get(variant.replace("_scale", ""), {}).items()})
+        if seed is not None:
+            cfg["seed"] = seed
+        cfg.update(config or {})
+        per_ckpt = variant is not None and seed is not None
+        _wb_run = wandb.init(project=WANDB_PROJECT, entity=WANDB_ENTITY, job_type=job_type,
+                             group=WANDB_GROUP or (variant if variant is not None else job_type),
+                             id=wandb_id(variant, seed) if per_ckpt else None, resume="allow" if per_ckpt else None,
+                             name=name or (f"{variant}_s{seed}" if per_ckpt else job_type),
+                             # allow_val_change: stages 4/5 resume the training run from a different SLURM job, often a different GPU
+                             config=cfg, allow_val_change=True, dir=str(WORK_DIR), settings=wandb.Settings(silent=True))
+        _wb, _wb_quiet = wandb, False
+        # own x-axis per stage: a re-run (FORCE=1) overlays its curve instead of having its steps dropped as non-monotonic
+        for p in ("train", "tok", "closedloop"):
+            wandb.define_metric(f"{p}/step"); wandb.define_metric(f"{p}/*", step_metric=f"{p}/step")
+        log(f"wandb: {_wb_run.name} [{job_type}] {getattr(_wb_run, 'url', '') or '(offline)'}")
+    except Exception as e:
+        log(f"wandb init failed ({type(e).__name__}: {e}); continuing without it"); _wb_run = None
+    return _wb_run
+
+
+def _wb_fail(e):
+    global _wb_quiet
+    if not _wb_quiet:
+        log(f"wandb logging failed ({type(e).__name__}: {e}); further wandb warnings suppressed"); _wb_quiet = True
+
+
+def wandb_log(d, **kw):
+    if _wb_run is None: return
+    try: _wb.log({k: v for k, v in d.items() if v is not None}, **kw)
+    except Exception as e: _wb_fail(e)
+
+
+def _flat(d, prefix=""):
+    """Nested result dicts -> flat scalar keys, the shape run.summary wants."""
+    out = {}
+    for k, v in (d or {}).items():
+        key = f"{prefix}{k}"
+        if isinstance(v, dict): out.update(_flat(v, key + "/"))
+        elif isinstance(v, (int, float, bool, str)) and not (isinstance(v, float) and math.isnan(v)): out[key] = v
+    return out
+
+
+def wandb_summary(d, prefix=""):
+    """Final numbers of a stage: they land in run.summary, which is what the runs table and the reports read."""
+    if _wb_run is None: return
+    try: _wb_run.summary.update(_flat(d, prefix))
+    except Exception as e: _wb_fail(e)
+
+
+def wandb_table(key, rows):
+    """A list of uniform dicts as a wandb.Table (latency rows, per-suite breakdowns, aggregated tables)."""
+    if _wb_run is None or not rows: return
+    try:
+        cols = list(dict.fromkeys(k for r in rows for k in r))
+        _wb.log({key: _wb.Table(columns=cols, data=[[r.get(c) for c in cols] for r in rows])})
+    except Exception as e: _wb_fail(e)
+
+
+def wandb_images(mapping):
+    """{key: path} -> logged images. Missing files are skipped."""
+    if _wb_run is None: return
+    try:
+        d = {k: _wb.Image(str(p)) for k, p in mapping.items() if Path(p).exists()}
+        if d: _wb.log(d)
+    except Exception as e: _wb_fail(e)
+
+
+def wandb_video(key, path, fps=None):
+    """A rendered episode (mp4) onto the run, next to the numbers it illustrates."""
+    if _wb_run is None or not Path(path).exists(): return
+    try: _wb.log({key: _wb.Video(str(path), fps=fps or FPS, format="mp4")})
+    except Exception as e: _wb_fail(e)
+
+
+def wandb_save(*paths):
+    """Attach result files (tables.md, summary.json, ...) to the run."""
+    if _wb_run is None: return
+    try:
+        for p in paths:
+            if Path(p).exists(): _wb.save(str(p), base_path=str(Path(p).parent), policy="now")
+    except Exception as e: _wb_fail(e)
+
+
+def wandb_finish():
+    global _wb_run
+    if _wb_run is None: return
+    try: _wb.finish()
+    except Exception as e: _wb_fail(e)
+    _wb_run = None
+
+
 def seed_all(seed):
     torch.manual_seed(seed); np.random.seed(seed)
 

@@ -14,3 +14,4 @@ robosuite==1.4.1
 bddl
 easydict
 cloudpickle
+wandb                 # optional; only imported when WANDB=1

@@ -52,7 +52,9 @@ w = torch.ones(IN, device=DEVICE); w[IN // 2:] = A.TOK_VEL_DIM_W
 def losses(x, xh, m):
     rec = (((xh - x) ** 2 * w) * m).sum() / (m.sum() * IN); mv = m[:, 1:] * m[:, :-1]
     vel = (((xh[:, 1:, JP] - xh[:, :-1, JP]) - (x[:, 1:, JP] - x[:, :-1, JP])) ** 2 * mv).sum() / (mv.sum() * (IN // 2)); return rec, vel
-log(f"tokenizer {sum(p.numel() for p in model.parameters())/1e6:.2f}M params, latent {model.latent_dim}, {len(tr)} train / {len(va)} val episodes, L_MAX {L_MAX}")
+n_par = sum(p.numel() for p in model.parameters()) / 1e6
+log(f"tokenizer {n_par:.2f}M params, latent {model.latent_dim}, {len(tr)} train / {len(va)} val episodes, L_MAX {L_MAX}")
+A.wandb_init("tokenizer", config=dict(params_M=round(n_par, 2), latent_dim=model.latent_dim, n_train_ep=len(tr), n_val_ep=len(va), L_MAX=L_MAX))
 hist = []; t0 = time.time(); model.train()
 for step in range(1, A.TOK_STEPS + 1):
     x, m = sample(tr, A.TOK_BATCH)
@@ -65,6 +67,8 @@ for step in range(1, A.TOK_STEPS + 1):
             xv, mv_ = sample(va, 128, full_frac=1.0); xvh, _, _ = model(xv)
             deg = ((((xvh.float()[..., JP] - xv[..., JP]) * std_jp) ** 2 * mv_).sum() / (mv_.sum() * (IN // 2))).sqrt().item() * 180 / math.pi
         model.train(); hist.append(dict(step=step, loss=loss.item(), val_deg=deg)); log(f"  step {step:5d} loss {loss.item():.4f} val joint RMSE {deg:.2f} deg  {time.time()-t0:.0f}s")
+        A.wandb_log({"tok/step": step, "tok/loss": loss.item(), "tok/rec": rec.item(), "tok/vel": vel.item(),
+                     "tok/val_joint_rmse_deg": deg, "tok/lr": sched.get_last_lr()[0], "tok/secs": time.time() - t0})
 
 model.eval(); lat_l, p_start, p_len, per_joint = [], [], [], []; npch = 0
 with torch.no_grad():
@@ -80,4 +84,8 @@ torch.save(dict(state_dict=model.state_dict(), mean=mean, std=std, config=dict(i
 np.save(A.TOK_DIR / "latents.npy", np.concatenate(lat_l))
 np.savez(A.TOK_DIR / "patch_index.npz", patch_start=np.array(p_start), patch_len=np.array(p_len), episode_task=ep_task, val_mask=val_mask, P=P)
 json.dump(ev, open(A.TOK_DIR / "tokenizer_eval.json", "w"), indent=2)
+A.wandb_summary(dict(mean_rmse_deg=ev["mean_rmse_deg"], max_joint_rmse_deg=round(pj.max().item(), 3), n_patches=npch,
+                     secs=round(time.time() - t0), **{f"joint{j}_rmse_deg": v for j, v in enumerate(ev["per_joint_rmse_deg"])}), prefix="tok/")
+A.wandb_table("tok/per_joint_rmse", [dict(joint=j, rmse_deg=v) for j, v in enumerate(ev["per_joint_rmse_deg"])])
+A.wandb_finish()
 log(f"stage 2 done: held-out FULL-episode per-joint RMSE (deg) {ev['per_joint_rmse_deg']}  mean {ev['mean_rmse_deg']:.2f}   {'OK' if pj.max() < 2 else '!! a joint exceeds 2 deg'}")

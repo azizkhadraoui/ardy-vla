@@ -18,6 +18,7 @@ import ardy_vla as A
 from ardy_vla import log, DEVICE
 
 D = A.load_data(vision=False); rows = []
+A.wandb_init("latency")
 def timeit(fn, n=30, warm=5):
     for _ in range(warm): fn()
     torch.cuda.synchronize(); t0 = time.perf_counter()
@@ -45,4 +46,8 @@ enc = A.OnlineEncoder(D.meta); img = np.zeros((128, 128, 3), np.uint8)
 ms_vis = timeit(lambda: enc(img)); ms_tok = timeit(lambda: D.tok.encode(torch.zeros(1, A.H * A.P, 2 * D.NJ, device=DEVICE)))
 out = dict(gpu=torch.cuda.get_device_name(0) if DEVICE == "cuda" else "cpu", torch=torch.__version__, rows=rows, vision_encode_ms_per_image=round(ms_vis, 2), history_tokenize_ms=round(ms_tok, 2),
            window_seconds=A.C * A.P / A.FPS, note="one window = 0.8 s of motion; a replan every 8 frames (0.4 s) needs sample + 2 x vision + tokenize < 400 ms to be real-time")
+A.wandb_table("latency/rows", rows)
+A.wandb_summary(dict(vision_encode_ms_per_image=out["vision_encode_ms_per_image"], history_tokenize_ms=out["history_tokenize_ms"],
+                     **{f'{r["variant"]}/sample_ms_{r["steps"]}step_cfg{r["cfg"]:g}': r["sample_ms"] for r in rows}), prefix="latency/")
+A.wandb_finish()
 json.dump(out, open(A.RES_DIR / "latency.json", "w"), indent=2); log(f"vision {ms_vis:.1f} ms/image, history tokenize {ms_tok:.1f} ms -> {A.RES_DIR/'latency.json'}")

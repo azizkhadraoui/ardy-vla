@@ -33,6 +33,10 @@ for m in ("mujoco", "robosuite", "bddl", "easydict"):
 import torch; print(f"  cuda {torch.cuda.is_available()}  bf16 not needed (fp16 AMP)")
 import mujoco; v = tuple(int(x) for x in mujoco.__version__.split('.')[:2]); print(f"  mujoco {mujoco.__version__}: {'OK for robosuite 1.4' if v < (3,3) else '!! >= 3.3 removes MjData.qM; pip install mujoco==3.1.6'}")
 PYEOF
+    if [ "${WANDB:-0}" = "1" ]; then
+      $PY -c "import wandb, os; print('  ok  wandb ' + wandb.__version__ + '  project=' + str(os.environ.get('WANDB_PROJECT')) + '  mode=' + os.environ.get('WANDB_MODE', 'online'))" ||
+        echo "  MISSING wandb but WANDB=1 (pip install wandb, or set WANDB=0) -- stages log nothing and run on"
+    else echo "  wandb off (WANDB=0)"; fi
     echo "  WORK_DIR=$WORK_DIR  DATA_DIR=$DATA_DIR  LIBERO_DIR=$LIBERO_DIR  PRESET=$PRESET"
     ;;
   data)      sub 01_run.sh ;;

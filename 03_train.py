@@ -37,8 +37,9 @@ opt = torch.optim.AdamW(model.parameters(), lr=A.LR, betas=(0.9, 0.99), weight_d
 sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, s / 500) * 0.5 * (1 + math.cos(math.pi * min(s, A.STEPS) / A.STEPS)))
 scaler = torch.amp.GradScaler("cuda", enabled=A.USE_AMP)
 log(f"=== {VARIANT} seed {SEED}: {n_par:.2f}M params, d={A.D_MODEL} layers={A.LAYERS} steps={A.STEPS} batch={A.BATCH}  {vcfg}")
+A.wandb_init("train", VARIANT, SEED, config=dict(params_M=round(n_par, 2), ckpt=dst.name, n_train_ep=len(D.train_eps), n_val_ep=len(D.val_eps)))
 
-rollout_pool = []
+rollout_pool = []; step_now = [0]
 def refresh_rollout_pool(n_batches=8):
     """Self-generated histories: roll the current model forward ROLLOUT_HIST patches from GT history (no goal), then
     use the generated tokens as the recent history of a training window whose target is still ground truth."""
@@ -58,9 +59,11 @@ def refresh_rollout_pool(n_batches=8):
             bb["hist"] = torch.cat([bb["hist"][:, :A.H - back], gen], 1)                        # replace the most recent `back` GT patches with generated ones
             rollout_pool.append(bb)
     model.train(); log(f"  rollout pool refreshed: {len(rollout_pool)} batches")
+    A.wandb_log({"train/step": step_now[0], "train/rollout_pool_batches": len(rollout_pool)})
 
 hist = []; t0 = time.time(); model.train()
 for step in range(1, A.STEPS + 1):
+    step_now[0] = step
     if vcfg["rollout"] and (step == 1 or step % A.ROLLOUT_REFRESH == 0): refresh_rollout_pool()
     if vcfg["rollout"] and rollout_pool and np.random.rand() < A.ROLLOUT_FRAC:
         b = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in rollout_pool[np.random.randint(len(rollout_pool))].items()}
@@ -87,7 +90,15 @@ for step in range(1, A.STEPS + 1):
     opt.zero_grad(set_to_none=True); scaler.scale(loss).backward(); scaler.unscale_(opt); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); scaler.step(opt); scaler.update(); sched.step()
     if step % 250 == 0 or step == 1:
         hist.append(dict(step=step, loss=loss.item(), hyb=l_hyb.item(), goal=l_goal.item(), goal_body=l_goal_body.item(), body=l_body.item(), consist=l_con.item()))
+        A.wandb_log({"train/step": step, "train/loss": loss.item(), "train/hyb": l_hyb.item(), "train/goal": l_goal.item(),
+                     "train/goal_body": l_goal_body.item(), "train/body": l_body.item(), "train/consist": l_con.item(),
+                     "train/lr": sched.get_last_lr()[0], "train/grad_scale": scaler.get_scale(),
+                     "train/steps_per_s": step / max(time.time() - t0, 1e-6), "train/secs": time.time() - t0})
         if step % 2000 == 0 or step == 1: log(f"  step {step:6d} loss {loss.item():.4f} | hyb {l_hyb.item():.4f} goal {l_goal.item():.4f} goal_body {l_goal_body.item():.4f} body {l_body.item():.4f} consist {l_con.item():.4f} | {time.time()-t0:.0f}s")
     if step % 5000 == 0: torch.save(dict(state_dict=model.state_dict(), variant=vcfg, name=VARIANT, seed=SEED, d_model=A.D_MODEL, layers=A.LAYERS, step=step, history=hist), dst)
 torch.save(dict(state_dict=model.state_dict(), variant=vcfg, name=VARIANT, seed=SEED, d_model=A.D_MODEL, layers=A.LAYERS, step=A.STEPS, history=hist, preset=A.PRESET, secs=round(time.time() - t0)), dst)
+A.wandb_summary(dict(params_M=round(n_par, 2), final_loss=hist[-1]["loss"], final_hyb=hist[-1]["hyb"], final_body=hist[-1]["body"],
+                     final_goal=hist[-1]["goal"], final_goal_body=hist[-1]["goal_body"], final_consist=hist[-1]["consist"],
+                     minutes=round((time.time() - t0) / 60, 1)), prefix="train/")
+A.wandb_finish()
 log(f"saved {dst}  ({(time.time()-t0)/60:.0f} min)")

@@ -23,6 +23,7 @@ conda create -n ardy python=3.11 -y && conda activate ardy
 pip install torch --index-url https://download.pytorch.org/whl/cu121
 pip install "transformers>=4.40" huggingface_hub sentencepiece h5py "imageio[ffmpeg]" matplotlib pillow scipy
 pip install mujoco==3.1.6 robosuite==1.4.1 bddl easydict cloudpickle
+pip install wandb                 # optional, only used when WANDB=1 -- see "Weights & Biases" below
 git clone --depth 1 https://github.com/Lifelong-Robot-Learning/LIBERO $LIBERO_DIR   # 01 also does this if absent
 
 bash submit_all.sh check          # refuses with a clear message if a file or a module is missing
@@ -40,7 +41,7 @@ Optional: put a Hugging Face token in `HF_TOKEN` in env.sh â€” the unauthenticat
 
 | File | Stage | What it settles | GPU | Time |
 |---|---|---|---|---|
-| `ardy_vla.py` | â€” | Shared library: data, tokenizer, denoiser, samplers (CFG / inpainting / guidance), FK, projection, open-loop metrics, closed-loop LIBERO runner. Every script imports it so training and both evaluators share one definition of everything. | â€” | â€” |
+| `ardy_vla.py` | â€” | Shared library: data, tokenizer, denoiser, samplers (CFG / inpainting / guidance), FK, projection, open-loop metrics, closed-loop LIBERO runner, and the optional W&B helpers. Every script imports it so training and both evaluators share one definition of everything. | â€” | â€” |
 | `01_prepare_data.py` + `01_run.sh` | 1 | Four suites, 40 tasks, 2 000 demos as one dataset. Explicit EE stream **defined** as FK(joints); frozen DINOv2/T5 features; gripper command threshold. | yes | ~1.5 h |
 | `02_tokenizer.py` + `02_run.sh` | 2 | FSQ motion tokenizer on all suites, trained on full episodes (the crop-only bug is what made the first tokenizer read 7.8Â°). | yes | ~0.5 h |
 | `03_train.py` + `03_run.sh` | 3 | The matrix: 6 variants Ã— 3 seeds as a SLURM array, d=384 / 6 layers / 30k steps. `scale` mode adds the d=512 point. | yes | 18 Ã— ~40 min |
@@ -133,6 +134,46 @@ If (c) fails, the paper reports the projection as the mechanism that couples the
 
 Send me `results/*.json`, `tables.md`, `lookups.txt` and the figures directory and I can write the results section
 and the honest limitations paragraph in one pass.
+
+---
+
+## Weights & Biases (optional)
+
+Off by default: with `WANDB=0` nothing is imported and every logging call in the pack is a no-op, so the JSON files
+above stay the source of truth. To turn it on, once on the login node:
+
+```bash
+pip install wandb && wandb login
+# in env.sh
+export WANDB=1
+export WANDB_PROJECT=ardy-vla
+export WANDB_ENTITY=your-team        # optional
+```
+
+**One run per checkpoint.** Stages 3, 4 and 5 attach to the same run id `{variant}_s{seed}` (`_quick` / `_scale`
+suffixed off the `long` preset), grouped by variant. So one row of the runs table carries a variant's training curve,
+its open-loop adherence *and* its closed-loop success, and the 18 rows of the matrix sort and filter by
+`config.variant` / `config.seed` without any joining by hand. Stages 2, 6, 7 and 8 get their own runs.
+
+| Stage | Logged live | In the run summary |
+|---|---|---|
+| 02 tokenizer | `tok/loss`, `tok/rec`, `tok/vel`, `tok/val_joint_rmse_deg`, `tok/lr` every 500 steps | per-joint held-out RMSE + the mean and max, as summary keys and a table |
+| 03 train | every 250 steps: `train/loss` and each term (`hyb`, `goal`, `goal_body`, `body`, `consist`), `train/lr`, `train/grad_scale`, `train/steps_per_s`; rollout-pool refreshes for the rollout variant | final losses, params, minutes |
+| 04 open loop | — | every `openloop/*` metric, the per-suite breakdown, and the adherence-vs-horizon curve as a table |
+| 05 closed loop | per task as the 2.6 h job runs: `closedloop/task/{proto}_success` and the running mean over the tasks finished so far — you see the success rate forming instead of waiting for the JSON | per-protocol and per-suite summaries, episode count, hours |
+| 06 latency | — | the full row table, plus `sample_ms` per (variant, steps, cfg) |
+| 07 aggregate | — | `summary.json` flattened, `tables.md` + `summary.json` attached, every figure as an image |
+| 08 visualize | the side-by-side `.mp4` per episode and its trajectory figure | — |
+
+Metrics use per-stage x-axes (`train/step`, `tok/step`, `closedloop/step`), so re-running a stage with `FORCE=1`
+overlays a second curve rather than having its steps dropped as non-monotonic.
+
+**Compute nodes without outbound network:** `export WANDB_MODE=offline` in env.sh, then from the login node
+`wandb sync $WORK_DIR/wandb/offline-run-*`. Offline runs of stages 3/4/5 are separate directories that sync into the
+one run id. `submit_all.sh check` reports whether wandb imports and which mode it will use.
+
+Nothing about this is load-bearing: a wandb failure — no package, no network, an expired key, a broken run — is
+caught, printed once, and the stage runs on and writes its JSON exactly as before.
 
 ---
 

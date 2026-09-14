@@ -10,6 +10,8 @@ venv/
 
 # run outputs
 runs/
+work/
+wandb/
 libero_hdf5/
 LIBERO/
 *.log

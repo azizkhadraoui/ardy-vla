@@ -33,6 +33,7 @@ meta = json.load(open(A.DATA / "meta.json"))
 epi = {v: {os.path.basename(p)[:-4]: p for p in glob.glob(str(A.EPI_DIR / f"{v}_s{VIS_SEED}" / "*.npz"))} for v in VIS_VARIANTS}
 common = sorted(set.intersection(*[set(d) for d in epi.values()])) if all(epi.values()) else sorted(epi[VIS_VARIANTS[0]])
 log(f"{len(common)} recorded episodes shared by {VIS_VARIANTS}")
+A.wandb_init("visualize", name="visualize", config=dict(vis_variants=VIS_VARIANTS, vis_seed=VIS_SEED, vis_max=VIS_MAX, n_episodes=len(common)))
 
 # camera matrices per task (built once per task from the env, no rendering)
 A.ensure_libero_repo(); A.patch_robosuite()
@@ -86,8 +87,12 @@ for name in common[:VIS_MAX]:
     if not np.isnan(r0["box_center"]).any(): ax.scatter(*r0["box_center"], c="orange", marker="s", s=120, label="box (6 cm)"); ax2.scatter(r0["box_center"][0], r0["box_center"][1], c="orange", marker="s", s=120)
     ax.set_title(f"{suite} task {ti} init {ipart} — {proto}: {str(r0['language'])[:60]}", fontsize=8); ax.legend(fontsize=7); ax2.set_aspect("equal"); ax2.grid(alpha=0.3); ax2.set_title("top-down")
     plt.tight_layout(); plt.savefig(A.FIG_DIR / f"{name.rsplit('_', 1)[0]}__{proto}_trajectories.png", dpi=130); plt.close()
+    A.wandb_video(f"videos/{proto}/{vp.stem}", vp)
+    A.wandb_images({f"trajectories/{proto}/{name.rsplit('_', 1)[0]}": A.FIG_DIR / f"{name.rsplit('_', 1)[0]}__{proto}_trajectories.png"})
     log(f"{vp.name}  ({T} frames, cameras {cams})")
 if gallery:
     seen = {}; [seen.setdefault(p, f) for p, f in gallery]
     Image.fromarray(np.concatenate([np.asarray(Image.fromarray(f).resize((f.shape[1] // 2, f.shape[0] // 2))) for f in seen.values()], 0)).save(A.FIG_DIR / "steering_gallery.png")
+    A.wandb_images({"figures/steering_gallery": A.FIG_DIR / "steering_gallery.png"})
     log(f"steering_gallery.png: {list(seen)}")
+A.wandb_finish()

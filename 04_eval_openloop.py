@@ -35,6 +35,7 @@ for variant, seed in todo:
     name = variant.replace("_scale", ""); vcfg = A.VARIANTS[name]
     ck = torch.load(A.CKPT_DIR / f"{variant}_s{seed}.pt", map_location=A.DEVICE, weights_only=False)
     model = A.HybridDenoiser(D, ck["variant"], d=ck.get("d_model", A.D_MODEL), layers=ck.get("layers", A.LAYERS)).to(A.DEVICE); model.load_state_dict(ck["state_dict"]); model.eval()
+    A.wandb_init("openloop", variant, seed, config=dict(ckpt_step=ck.get("step")))
     A.seed_all(1000 + seed); t0 = time.time()
     r = A.evaluate_openloop(D, model, vcfg, D.val_eps)
     # per-suite breakdown of the two headline numbers
@@ -46,6 +47,15 @@ for variant, seed in todo:
             per_suite[suite] = {k: rs[k] for k in rs if k.startswith(("inwin_goal_pos", "inwin_goal_fk", "outwin_goal_pos", "outwin_goal_fk", "outwin_nogoal"))}
     out = dict(variant=variant, seed=seed, steps=ck.get("step"), d_model=ck.get("d_model"), layers=ck.get("layers"), metrics=r, per_suite=per_suite, secs=round(time.time() - t0))
     json.dump(out, open(dst, "w"), indent=2)
+    A.wandb_summary(dict(r, secs=out["secs"]), prefix="openloop/")
+    A.wandb_summary(per_suite, prefix="openloop/suite/")
+    # the headline figure as a curve: error at the goal frame against how far ahead the goal is
+    A.wandb_table("openloop/adherence_vs_horizon", [
+        dict(horizon_s=round(h * A.P / A.FPS, 2),
+             **{k: r.get(f"h{h}_{k}") for k in ("goal_pos_err_cm", "goal_fk_err_cm", "goal_fkproj_err_cm",
+                                                "goal_rot_err_deg", "goal_jump_excess_cm", "nogoal_fk_err_cm")})
+        for h in A.HORIZONS])
+    A.wandb_finish()
     log(f"{variant} s{seed}: in-goal {r.get('inwin_goal_pos_err_cm'):.2f} / in-FK {r.get('inwin_goal_fk_err_cm'):.2f} | h8 goal {r.get('h8_goal_pos_err_cm'):.2f} FK {r.get('h8_goal_fk_err_cm'):.2f} "
         f"FKproj {r.get('h8_goal_fkproj_err_cm', float('nan')):.2f} | h8 no-goal FK {r.get('h8_nogoal_fk_err_cm'):.2f} | jump {r.get('h8_goal_jump_excess_cm'):+.2f}  ({out['secs']}s) -> {dst.name}")
     del model; torch.cuda.empty_cache()

@@ -160,4 +160,10 @@ if hists:
     for n, h in hists.items():
         if h: ax.plot([r["step"] for r in h], [r["hyb"] + r["body"] for r in h], label=n, lw=0.8)
     ax.set_yscale("log"); ax.set_xlabel("step"); ax.set_ylabel("hybrid + body loss"); ax.legend(fontsize=5, ncol=2); plt.tight_layout(); plt.savefig(FIG / "training_curves.png", dpi=140); plt.close()
+# the paper's own artefacts on one run: the tables as text, summary.json attached, every figure as an image
+A.wandb_init("aggregate", name="aggregate", config=dict(n_openloop=sum(len(v) for v in ol.values()), n_closedloop=sum(len(v) for v in cl.values())))
+A.wandb_summary(summary)
+A.wandb_images({f"figures/{f.stem}": f for f in sorted(FIG.glob("*.png"))})
+A.wandb_save(RES / "tables.md", RES / "summary.json")
+A.wandb_finish()
 print(f"\ntables -> {RES/'tables.md'}   summary -> {RES/'summary.json'}   figures -> {FIG}")

@@ -51,6 +51,8 @@ ck = torch.load(A.CKPT_DIR / f"{VARIANT}_s{SEED}.pt", map_location=DEVICE, weigh
 model = A.HybridDenoiser(D, ck["variant"], d=ck.get("d_model", A.D_MODEL), layers=ck.get("layers", A.LAYERS)).to(DEVICE); model.load_state_dict(ck["state_dict"]); model.eval()
 enc = A.OnlineEncoder(D.meta)
 records = []; epi_dir = A.EPI_DIR / f"{VARIANT}_s{SEED}"; epi_dir.mkdir(exist_ok=True)
+A.wandb_init("closedloop", VARIANT, SEED, config=dict(ckpt_step=ck.get("step"), n_init=N_INIT, n_init_proto=N_INIT_PROTO,
+             protocols=PROTOCOLS, cl_suites=CL_SUITES, proto_suites=PROTO_SUITES, exec_frames=EXEC, project=PROJECT))
 
 
 def demo_goal(D, ep, frame, mask_kind):
@@ -114,6 +116,11 @@ for ti, info in enumerate(D.meta["tasks"]):
     task.close()
     summ = {p: np.mean([r["success"] for r in done_here if r["protocol"] == p]) for p in dict.fromkeys(r["protocol"] for r in done_here)}
     log(f"task {ti:2d} {info['suite']:14s} {info['language'][:50]:50s} " + " ".join(f"{p}={v:.2f}" for p, v in summ.items()) + f"  ({time.time()-t0:.0f}s)")
+    # running view of a 2.6 h job: per-task success as it lands, and the running mean over every task finished so far
+    A.wandb_log({"closedloop/step": ti, "closedloop/task_secs": time.time() - t0,
+                 **{f"closedloop/task/{p}_success": v for p, v in summ.items()},
+                 **{f"closedloop/running/{p}_success": float(np.mean([r["success"] for r in records if r["protocol"] == p]))
+                    for p in dict.fromkeys(r["protocol"] for r in records)}})
     json.dump(dict(variant=VARIANT, seed=SEED, project=PROJECT, exec_frames=EXEC, n_init=N_INIT, n_init_proto=N_INIT_PROTO, records=records, partial=True), open(dst, "w"))
 
 # ---- summaries -----------------------------------------------------------------------------------------
@@ -135,4 +142,11 @@ for p, s in summary["all"].items():
     print(f" {p:10s}{s['n']:>6d}{s['success']:>10.3f}{f(s.get('adherence_cm'), 14)}{f(s.get('grip_err_mm'), 10)}{f(s.get('collision'), 11)}{f(s.get('accel_cm'), 10)}")
 print("=" * 100); print("READING: std is the number next to published LIBERO results. P4/P1/P2 adherence is whether the constraint was met in closed loop;\n"
                         "P1 collision is whether the lift actually cleared the box. P3b - P3a is the recovery the steering buys under a real disturbance.")
+A.wandb_summary(summary["all"], prefix="closedloop/")
+A.wandb_summary(summary["per_suite"], prefix="closedloop/suite/")
+A.wandb_summary(dict(hours=round((time.time() - t_all) / 3600, 2), n_episodes=len(records)), prefix="closedloop/")
+A.wandb_table("closedloop/protocols", [dict(protocol=pr, **su_) for pr, su_ in summary["all"].items()])
+A.wandb_table("closedloop/per_suite", [dict(suite=sn, protocol=pr, **su_)
+                                       for sn, d_ in summary["per_suite"].items() for pr, su_ in d_.items()])
+A.wandb_finish()
 log(f"raw results -> {dst}")
