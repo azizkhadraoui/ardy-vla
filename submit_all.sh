@@ -27,7 +27,7 @@ import importlib, sys
 for m in ("torch", "transformers", "h5py", "huggingface_hub", "imageio", "matplotlib", "PIL"):
     try: importlib.import_module(m); print(f"  ok  {m}")
     except Exception as e: print(f"  MISSING {m}: {e}")
-for m in ("mujoco", "robosuite", "bddl", "easydict"):
+for m in ("mujoco", "robosuite", "bddl", "easydict", "gym"):
     try: mod = importlib.import_module(m); print(f"  ok  {m} {getattr(mod, '__version__', '')}")
     except Exception as e: print(f"  MISSING {m} (needed by 05/08 only): {e}")
 import torch; print(f"  cuda {torch.cuda.is_available()}  bf16 not needed (fp16 AMP)")

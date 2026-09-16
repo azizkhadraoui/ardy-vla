@@ -12,6 +12,8 @@ numpy
 mujoco==3.1.6
 robosuite==1.4.1
 bddl
+gym==0.26.2        # LIBERO's envs/venv.py imports it (for vector envs this pack never uses); it is the
+                   # last gym release and prints a NumPy 2 warning, but the import LIBERO needs works
 easydict
 cloudpickle
 wandb                 # optional; only imported when WANDB=1
