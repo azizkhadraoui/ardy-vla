@@ -42,7 +42,7 @@ Optional: put a Hugging Face token in `HF_TOKEN` in env.sh — the unauthenticat
 | File | Stage | What it settles | GPU | Time |
 |---|---|---|---|---|
 | `ardy_vla.py` | — | Shared library: data, tokenizer, denoiser, samplers (CFG / inpainting / guidance), FK, projection, open-loop metrics, closed-loop LIBERO runner, and the optional W&B helpers. Every script imports it so training and both evaluators share one definition of everything. | — | — |
-| `01_prepare_data.py` + `01_run.sh` | 1 | Four suites, 40 tasks, 2 000 demos as one dataset. Explicit EE stream **defined** as FK(joints); frozen DINOv2/T5 features; gripper command threshold. | yes | ~1.5 h |
+| `01_prepare_data.py` + `01_run.sh` | 1 | Four suites, 40 tasks, 2 000 demos as one dataset. Explicit EE stream **defined** as FK(joints) in the robot's own base frame (see *The EE frame* below); frozen DINOv2/T5 features; gripper command threshold. | yes | ~1.5 h |
 | `02_tokenizer.py` + `02_run.sh` | 2 | FSQ motion tokenizer on all suites, trained on full episodes (the crop-only bug is what made the first tokenizer read 7.8°). | yes | ~0.5 h |
 | `03_train.py` + `03_run.sh` | 3 | The matrix: 6 variants × 3 seeds as a SLURM array, d=384 / 6 layers / 30k steps. `scale` mode adds the d=512 point. | yes | 18 × ~40 min |
 | `04_eval_openloop.py` + `04_run.sh` | 4 | **T3.** Adherence vs horizon (0.8–3.2 s) on explicit stream, decoded body, projected body, against the no-goal reference. Per checkpoint, per suite. | yes | 18 × ~8 min |
@@ -54,6 +54,36 @@ Optional: put a Hugging Face token in `HF_TOKEN` in env.sh — the unauthenticat
 | `submit_all.sh` | — | Submission in eight modes, including the full dependency chain and the decision gate. | — | — |
 
 \* 08 builds each task env once to read camera matrices, so it needs the simulator installed, not a GPU.
+
+---
+
+## The EE frame, and why the FK check is per task
+
+LIBERO places the robot base at a **scene-dependent world position**. Fitting one base+tool SE(3) so that
+`base o FK(joints) o tool` reproduces the dataset's world-frame `ee_pos` gives 0.03 cm on `libero_object`
+alone and 0.03 cm on `libero_goal` alone -- and **35-40 cm pooled**, because those suites sit in different
+scenes. `libero_10` fails the same way *on its own* (24 cm): it is the one suite whose ten tasks span
+KITCHEN, LIVING_ROOM and STUDY. The fitted base translations differ by about 0.9 m in z between suites.
+
+The rotation target is not the cause: refitting with identity `R`, or with the rotation term dropped
+entirely, moves the pooled residual by less than a centimetre (39.8 -> 39.1 -> 38.7 cm).
+
+So 01 fits **one base per task and one tool shared by all of them** (`fit_fk_grouped`) and then defines the
+stream the model sees *without* the base:
+
+```
+explicit stream := FK(joints) o tool        # the EE in the robot's own base frame
+```
+
+The base offset is a property of the scene, not of the arm. It carries nothing a policy can use, and in world
+frame it makes the same reach look different in every scene. Goals, adherence, the P1 box and the closed-loop
+history all live in this one frame, so everything stays self-consistent. The per-task base transforms are
+stored in `proprio.npz` (`fk_base_r6`, `fk_base_t`) and used in exactly one place: 05 puts recorded
+trajectories back into world coordinates so 08 can draw them into camera images.
+
+The data-integrity gate is kept and tightened -- the **max over tasks** of the per-task residual must be
+under 1 cm, where it used to be a per-suite mean. A task that will not fit means the joint/EE pairing is
+wrong for it and nothing downstream is trustworthy. Raising the threshold is never the fix.
 
 ---
 
@@ -159,11 +189,11 @@ its open-loop adherence *and* its closed-loop success, and the 18 rows of the ma
 |---|---|---|
 | 02 tokenizer | `tok/loss`, `tok/rec`, `tok/vel`, `tok/val_joint_rmse_deg`, `tok/lr` every 500 steps | per-joint held-out RMSE + the mean and max, as summary keys and a table |
 | 03 train | every 250 steps: `train/loss` and each term (`hyb`, `goal`, `goal_body`, `body`, `consist`), `train/lr`, `train/grad_scale`, `train/steps_per_s`; rollout-pool refreshes for the rollout variant | final losses, params, minutes |
-| 04 open loop | � | every `openloop/*` metric, the per-suite breakdown, and the adherence-vs-horizon curve as a table |
-| 05 closed loop | per task as the 2.6 h job runs: `closedloop/task/{proto}_success` and the running mean over the tasks finished so far � you see the success rate forming instead of waiting for the JSON | per-protocol and per-suite summaries, episode count, hours |
-| 06 latency | � | the full row table, plus `sample_ms` per (variant, steps, cfg) |
-| 07 aggregate | � | `summary.json` flattened, `tables.md` + `summary.json` attached, every figure as an image |
-| 08 visualize | the side-by-side `.mp4` per episode and its trajectory figure | � |
+| 04 open loop | — | every `openloop/*` metric, the per-suite breakdown, and the adherence-vs-horizon curve as a table |
+| 05 closed loop | per task as the 2.6 h job runs: `closedloop/task/{proto}_success` and the running mean over the tasks finished so far — you see the success rate forming instead of waiting for the JSON | per-protocol and per-suite summaries, episode count, hours |
+| 06 latency | — | the full row table, plus `sample_ms` per (variant, steps, cfg) |
+| 07 aggregate | — | `summary.json` flattened, `tables.md` + `summary.json` attached, every figure as an image |
+| 08 visualize | the side-by-side `.mp4` per episode and its trajectory figure | — |
 
 Metrics use per-stage x-axes (`train/step`, `tok/step`, `closedloop/step`), so re-running a stage with `FORCE=1`
 overlays a second curve rather than having its steps dropped as non-monotonic.
@@ -172,7 +202,7 @@ overlays a second curve rather than having its steps dropped as non-monotonic.
 `wandb sync $WORK_DIR/wandb/offline-run-*`. Offline runs of stages 3/4/5 are separate directories that sync into the
 one run id. `submit_all.sh check` reports whether wandb imports and which mode it will use.
 
-Nothing about this is load-bearing: a wandb failure � no package, no network, an expired key, a broken run � is
+Nothing about this is load-bearing: a wandb failure — no package, no network, an expired key, a broken run — is
 caught, printed once, and the stage runs on and writes its JSON exactly as before.
 
 ---

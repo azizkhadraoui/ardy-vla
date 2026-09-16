@@ -70,21 +70,41 @@ ep_start, ep_len, ep_task = np.array(ep_start), np.array(ep_len), np.array(ep_ta
 joint_pos, gripper, ee_pos_ds, ee_rot6d_ds, actions = [np.concatenate(a) for a in (JP, GR, EP_, ER6, ACT)]
 log(f"pass 1: {len(tasks)} tasks, {len(ep_len)} episodes, {n} frames, mean len {ep_len.mean():.0f}")
 
-# ---- FK: fit base/tool once, then DEFINE the explicit stream from the joints ---------------------
-idx = np.random.default_rng(0).choice(n, 16384, replace=False)
+# ---- FK: one base per task, one shared tool; the explicit stream is the ROBOT-BASE-FRAME EE ------
+# LIBERO puts the robot base at a scene-dependent world position (libero_10 alone spans KITCHEN, LIVING_ROOM
+# and STUDY scenes), so no single base transform maps FK(joints) onto the dataset's world-frame ee_pos: pooled
+# it lands 30-50 cm off while each scene alone fits to well under a millimetre. The fix is not a looser
+# threshold. The base offset is a property of the scene, carries no information about the arm, and would make
+# the same motion look different in each scene, so the stream the model sees is defined WITHOUT it:
+#     explicit stream := FK(joints) o tool        (the EE in the robot's own base frame, scene-independent)
+# The per-task base transforms are fitted anyway, kept for putting a trajectory back into world coordinates
+# (05 records world-frame paths for the videos in 08), and used for the data-integrity check below.
+frame_task = np.repeat(ep_task, ep_len)
+idx = np.random.default_rng(0).choice(n, min(65536, n), replace=False)
 q_t, ee_t = torch.tensor(joint_pos, device=A.DEVICE), torch.tensor(ee_pos_ds, device=A.DEVICE); R_t = A.rot6d_to_mat(torch.tensor(ee_rot6d_ds, device=A.DEVICE))
-params = A.fit_fk(q_t[idx], ee_t[idx], R_t[idx], iters=4000)
-pos_l, R_l = [], []
+gid_t = torch.tensor(frame_task, device=A.DEVICE, dtype=torch.long)
+base_r6, base_t, tool_r6, tool_t = A.fit_fk_grouped(q_t[idx], ee_t[idx], R_t[idx], gid_t[idx], len(tasks), iters=4000)
+params = [torch.tensor([1., 0, 0, 0, 1, 0], device=A.DEVICE), torch.zeros(3, device=A.DEVICE), tool_r6, tool_t]   # base-frame stream
+pos_l, R_l, res_l = [], [], []
 with torch.no_grad():
     for s0 in range(0, n, 16384):
-        pp, RR = A.fk_with(params, q_t[s0:s0 + 16384]); pos_l.append(pp.cpu().numpy()); R_l.append(A.mat_to_rot6d(RR).cpu().numpy())
+        sl = slice(s0, min(s0 + 16384, n))
+        pp, RR = A.fk_with(params, q_t[sl]); pos_l.append(pp.cpu().numpy()); R_l.append(A.mat_to_rot6d(RR).cpu().numpy())
+        wp, _ = A.fk_grouped(base_r6, base_t, tool_r6, tool_t, q_t[sl], gid_t[sl])          # the same poses back in world frame
+        res_l.append((wp - ee_t[sl]).norm(dim=-1).cpu().numpy())
 ee_pos, ee_rot6d = np.concatenate(pos_l).astype(np.float32), np.concatenate(R_l).astype(np.float32)
-fk_res = {}
-for suite in files_by_suite:
-    m = np.isin(ep_task, [i for i, t in enumerate(tasks) if t["suite"] == suite]); fr = np.concatenate([np.arange(ep_start[e], ep_start[e] + ep_len[e]) for e in np.where(m)[0]])
-    fk_res[suite] = float(np.linalg.norm(ee_pos[fr] - ee_pos_ds[fr], axis=-1).mean() * 100)
-log(f"explicit EE stream defined from FK; dataset EE differs by (cm per suite): {fk_res}")
-assert max(fk_res.values()) < 1.0, "FK does not reproduce the dataset EE for some suite: check joint/EE key pairing"
+res_cm = np.concatenate(res_l) * 100
+# the gate, now per task rather than per suite: a wrong joint/EE pairing shows up as a task that will not fit
+task_res = np.array([float(res_cm[frame_task == i].mean()) for i in range(len(tasks))])
+fk_res = {s: float(task_res[[i for i, t in enumerate(tasks) if t["suite"] == s]].max()) for s in files_by_suite}
+worst = int(task_res.argmax())
+log(f"explicit EE stream defined from FK in the robot base frame; base+tool reproduces the dataset's world EE to "
+    f"(worst task per suite, cm): { {k: round(v, 3) for k, v in fk_res.items()} }")
+log(f"  worst task overall: {tasks[worst]['suite']}/{tasks[worst]['file']} at {task_res[worst]:.3f} cm; mean over all frames {res_cm.mean():.3f} cm")
+log(f"  fitted base translations span {np.abs(base_t.cpu().numpy() - base_t.cpu().numpy().mean(0)).max()*100:.1f} cm across tasks "
+    f"(that spread is the scene offset the old single-base fit was trying to average away)")
+assert task_res.max() < 1.0, (f"FK does not reproduce the dataset EE for task {tasks[worst]['file']} "
+                              f"({task_res[worst]:.2f} cm): check the joint/EE key pairing")
 joint_vel = np.concatenate([np.gradient(joint_pos[ep_start[e]:ep_start[e] + ep_len[e]], axis=0) * A.FPS for e in range(len(ep_len))]).astype(np.float32)
 
 # ---- gripper threshold: finger width midpoint between demo open (-1) and close (+1) commands -------
@@ -94,7 +114,9 @@ log(f"gripper threshold {thr*100:.2f} cm  (closed mean {width[a>0].mean()*100:.2
 
 np.savez_compressed(A.DATA / "proprio.npz", joint_pos=joint_pos, joint_vel=joint_vel, gripper=gripper, ee_pos=ee_pos, ee_rot6d=ee_rot6d, ee_pos_dataset=ee_pos_ds, ee_rot6d_dataset=ee_rot6d_ds,
                     actions=actions, episode_start=ep_start, episode_len=ep_len, episode_task=ep_task,
-                    fk_base_r6=params[0].cpu().numpy(), fk_base_t=params[1].cpu().numpy(), fk_tool_r6=params[2].cpu().numpy(), fk_tool_t=params[3].cpu().numpy())
+                    fk_base_r6=base_r6.cpu().numpy(), fk_base_t=base_t.cpu().numpy(),          # per task (n_tasks, 6) / (n_tasks, 3): base-frame -> world
+                    fk_tool_r6=tool_r6.cpu().numpy(), fk_tool_t=tool_t.cpu().numpy(),            # shared flange -> EE
+                    fk_task_residual_cm=task_res.astype(np.float32))
 
 # ---- frozen vision features -----------------------------------------------------------------------
 VIS_NAME = "facebook/dinov2-small" if A.ENCODER == "dinov2" else "google/siglip-base-patch16-224"
@@ -132,5 +154,5 @@ with torch.no_grad():
     text_emb = ((hs * m).sum(1) / m.sum(1)).float().cpu().numpy()
 np.save(A.DATA / "text_emb.npy", text_emb)
 json.dump(dict(suites=list(files_by_suite), fps=A.FPS, num_frames=int(n), num_episodes=len(ep_len), tasks=tasks, vision_encoder=VIS_NAME, vision_tokens=NT, vision_dim=int(DV),
-               text_model=A.TEXT_MODEL, flip_180=A.FLIP_180, ee_from_fk=True, fk_dataset_offset_cm=fk_res, gripper_threshold_m=thr), open(A.DATA / "meta.json", "w"), indent=2)
+               text_model=A.TEXT_MODEL, flip_180=A.FLIP_180, ee_from_fk=True, ee_frame="robot_base", fk_dataset_offset_cm=fk_res, fk_task_residual_cm=[round(v, 4) for v in task_res.tolist()], gripper_threshold_m=thr), open(A.DATA / "meta.json", "w"), indent=2)
 log(f"stage 1 done -> {A.DATA}  (figures/preview_agentview_frame0.png: the table must be at the BOTTOM of the image)")

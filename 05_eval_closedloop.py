@@ -94,9 +94,13 @@ def run_condition(task, policy, init_idx, proto, record):
         lo, hi = max(0, f_goal - 10), min(ee.shape[0], f_goal + 10); rec["collision"] = bool((np.abs(ee[lo:hi] - box_center) < BOX).all(-1).any()); rec["box_center"] = box_center.tolist()
     if ee.shape[0] > 3: rec["accel_cm"] = float(np.linalg.norm(np.diff(ee, 2, axis=0), axis=-1).mean() * 100)
     if record:
-        np.savez_compressed(epi_dir / f"{task.info['suite']}_t{task.task_index}_i{init_idx}_{proto}.npz", ee_path=ee, grip=out["grip"], success=out["success"], protocol=proto,
-                            goal_pos=np.array(rec.get("goal_pos", [np.nan] * 3)), goal_frame=f_goal if f_goal is not None else -1, box_center=np.array(box_center if box_center is not None else [np.nan] * 3),
-                            plans=np.array([p[1] for p in out["plans"]]), plan_t=np.array([p[0] for p in out["plans"]]), language=task.info["language"],
+        # everything the model works in is the robot base frame; the videos in 08 draw into camera images,
+        # so the recorded geometry is put back into world coordinates here, once, with the task's base transform
+        w = lambda X: A.to_world(D, task.task_index, X)
+        np.savez_compressed(epi_dir / f"{task.info['suite']}_t{task.task_index}_i{init_idx}_{proto}.npz", ee_path=w(ee), grip=out["grip"], success=out["success"], protocol=proto,
+                            goal_pos=w(np.array(rec.get("goal_pos", [np.nan] * 3))), goal_frame=f_goal if f_goal is not None else -1,
+                            box_center=w(np.array(box_center if box_center is not None else [np.nan] * 3)),
+                            plans=w(np.array([p[1] for p in out["plans"]])), plan_t=np.array([p[0] for p in out["plans"]]), language=task.info["language"],
                             **{f"frames_{c}": np.stack(v) for c, v in out["frames"].items() if len(v)})
     return rec
 

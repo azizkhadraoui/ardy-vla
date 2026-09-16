@@ -277,6 +277,40 @@ def fk_with(params, q):
     return T[:, :3, 3], T[:, :3, :3]
 
 
+def se3_batch(r6, t):
+    """(G,6),(G,3) -> (G,4,4)."""
+    T = torch.eye(4, device=r6.device).repeat(r6.shape[0], 1, 1); T[:, :3, :3] = rot6d_to_mat(r6); T[:, :3, 3] = t; return T
+
+
+def fk_grouped(base_r6, base_t, tool_r6, tool_t, q, gid):
+    """base o FK(q) o tool, with the base chosen per row by `gid`. Returns world position and rotation."""
+    Tb = se3_batch(base_r6, base_t)[gid]; Tt = se3(tool_r6, tool_t)
+    T = Tb @ panda_fk(q) @ Tt[None]
+    return T[:, :3, 3], T[:, :3, :3]
+
+
+def fit_fk_grouped(q, ee, R, gid, n_groups, iters=4000, w_rot=0.1):
+    """Fit ONE base SE(3) per group and ONE tool SE(3) shared by all of them.
+
+    LIBERO places the robot base at a scene-dependent world position, so a single base transform cannot map
+    FK(joints) onto the dataset's world-frame ee_pos across scenes (it lands 30-50 cm off), while each scene
+    alone fits to well under a millimetre. The tool transform is the flange->EE offset of the robot itself and
+    is genuinely shared. Groups are tasks here: tasks in one scene simply converge to the same base.
+    """
+    base_r6 = nn.Parameter(torch.tensor([1., 0, 0, 0, 1, 0], device=q.device).repeat(n_groups, 1))
+    base_t = nn.Parameter(torch.zeros(n_groups, 3, device=q.device))
+    tool_r6 = nn.Parameter(torch.tensor([1., 0, 0, 0, 1, 0], device=q.device))
+    tool_t = nn.Parameter(torch.zeros(3, device=q.device))
+    params = [base_r6, base_t, tool_r6, tool_t]
+    opt = torch.optim.Adam(params, lr=1e-2)
+    for it in range(iters):
+        pos, Rp = fk_grouped(base_r6, base_t, tool_r6, tool_t, q, gid); loss = F.mse_loss(pos, ee) + w_rot * F.mse_loss(Rp, R)
+        opt.zero_grad(); loss.backward(); opt.step()
+        if it == int(iters * 0.6):
+            for g_ in opt.param_groups: g_["lr"] = 1e-3
+    return [p.detach() for p in params]
+
+
 def fit_fk(q, ee, R, iters=3000):
     """Fit base + tool SE(3) so that base ∘ FK(q) ∘ tool matches the dataset's (ee, R). Used once, in 01, to define the explicit stream."""
     params = [nn.Parameter(torch.tensor([1., 0, 0, 0, 1, 0], device=q.device)), nn.Parameter(torch.zeros(3, device=q.device)),
@@ -301,14 +335,33 @@ def download_suites(suites=SUITES):
     want = {"libero_spatial": 10, "libero_object": 10, "libero_goal": 10, "libero_10": 10, "libero_90": 90}
     token = os.environ.get("HF_TOKEN")
     for suite in suites:
+        last = None
         for attempt in range(10):
-            if len(libero_files(suite)) >= want[suite]: break
+            have = len(libero_files(suite))
+            if have >= want[suite]: break
             try:
                 snapshot_download(HF_REPO, repo_type="dataset", allow_patterns=[f"{suite}/*.hdf5"], local_dir=str(DATA_DIR), max_workers=2, token=token)
+                continue                                   # re-count at the top of the loop, not here
             except Exception as ex:
+                last = ex
+                # print what actually went wrong: the type alone (LocalProtocolError) says nothing and cost a session
+                log(f"{suite}: attempt {attempt+1}/10, {have}/{want[suite]} files, {type(ex).__name__}: {str(ex)[:300]}")
+                if attempt >= 4:                           # snapshot_download keeps failing -> resume file by file
+                    try:
+                        from huggingface_hub import hf_hub_download, list_repo_files
+                        names = [f for f in list_repo_files(HF_REPO, repo_type="dataset", token=token) if f.startswith(f"{suite}/") and f.endswith(".hdf5")]
+                        log(f"{suite}: falling back to per-file download of {len(names)} files")
+                        for fn in names:
+                            hf_hub_download(HF_REPO, fn, repo_type="dataset", local_dir=str(DATA_DIR), token=token)
+                        continue
+                    except Exception as ex2:
+                        last = ex2; log(f"{suite}: per-file download also failed, {type(ex2).__name__}: {str(ex2)[:300]}")
                 m = re.search(r"Retry after (\d+)", str(ex)); wait = int(m.group(1)) + 10 if m else 90
-                log(f"{suite}: attempt {attempt+1} {len(libero_files(suite))}/{want[suite]} files ({type(ex).__name__}); waiting {wait}s"); time.sleep(wait)
-        assert len(libero_files(suite)) >= want[suite], f"{suite}: only {len(libero_files(suite))}/{want[suite]} files; set HF_TOKEN"
+                log(f"{suite}: waiting {wait}s"); time.sleep(wait)
+        have = len(libero_files(suite))
+        if have < want[suite]:                             # do not hide the cause behind a bare assert
+            raise RuntimeError(f"{suite}: only {have}/{want[suite]} files under {DATA_DIR} after 10 attempts; "
+                               f"last error was {type(last).__name__}: {last}") from last
         log(f"{suite}: {len(libero_files(suite))} task files")
     return {s: libero_files(s) for s in suites}
 
@@ -407,13 +460,28 @@ def load_data(vision=True):
     D.pos_m_t, D.pos_s_t, D.gr_m_t, D.gr_s_t = [torch.tensor(a, device=DEVICE) for a in (D.pos_m, D.pos_s, D.gr_m, D.gr_s)]
     D.p_start_t, D.p_len_t, D.pf_start_t, D.pf_len_t, D.ep_start_t, D.ep_len_t, D.ep_task_t = [torch.from_numpy(a).to(DEVICE) for a in (D.p_start, D.p_len, D.pf_start, D.pf_len, D.ep_start, D.ep_len, D.ep_task)]
     D.pr = pr
-    D.fk_params = [torch.tensor(pr[k], device=DEVICE) for k in ("fk_base_r6", "fk_base_t", "fk_tool_r6", "fk_tool_t")]
+    # the explicit stream is the EE in the ROBOT BASE frame (01 defines it that way: the world offset is
+    # scene-dependent and carries nothing about the arm), so fk_params has an identity base and the shared tool.
+    D.fk_tool_r6, D.fk_tool_t = [torch.tensor(pr[k], device=DEVICE) for k in ("fk_tool_r6", "fk_tool_t")]
+    D.fk_params = [torch.tensor([1., 0, 0, 0, 1, 0], device=DEVICE), torch.zeros(3, device=DEVICE), D.fk_tool_r6, D.fk_tool_t]
+    # per task, base frame -> world; used only to draw recorded trajectories in camera images (05 -> 08)
+    D.fk_base_r6, D.fk_base_t = [torch.tensor(pr[k], device=DEVICE) for k in ("fk_base_r6", "fk_base_t")]
     D.gripper_threshold = float(D.meta["gripper_threshold_m"])
     log(f"data: {D.E} episodes ({len(D.train_eps)} train / {len(D.val_eps)} val), {D.hyb.shape[0]} patches, token {D.TOK} = {D.EXP} explicit + {D.LAT} latent, {len(D.meta['tasks'])} tasks")
     return D
 
 
 def unnorm_pos(D, x): return x * D.pos_s_t + D.pos_m_t
+
+
+def to_world(D, task_index, X):
+    """Base-frame positions (..., 3) -> world, via the task's fitted base transform. Drawing only: every metric
+    and every goal lives in the base frame, but 08 projects paths into camera images, which are world-framed."""
+    X = np.asarray(X, np.float32)
+    if X.size == 0: return X
+    T = se3(D.fk_base_r6[task_index], D.fk_base_t[task_index])
+    x = torch.from_numpy(X.reshape(-1, 3)).to(T.device)
+    return ((x @ T[:3, :3].T) + T[:3, 3]).cpu().numpy().reshape(X.shape)
 
 
 def fk_from_body(D, body_n):

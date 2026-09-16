@@ -8,6 +8,7 @@
 #SBATCH --time 4:00:00
 # Stage 4: open-loop adherence vs horizon for every checkpoint present (~8 min each, 18 ckpts ~2.5 h). Idempotent per checkpoint.
 set -e
-source "${ENV_SH:-$(dirname "${BASH_SOURCE[0]}")/env.sh}"
+# under sbatch, BASH_SOURCE points into Slurm's spool dir, not the submit dir -- SLURM_SUBMIT_DIR is where env.sh is
+source "${ENV_SH:-${SLURM_SUBMIT_DIR:-$(dirname "${BASH_SOURCE[0]}")}/env.sh}"
 $PY 04_eval_openloop.py
 echo "=== OPENLOOP DONE ==="

@@ -12,7 +12,8 @@
 # ~40 min each at PRESET=long on a V100. Pin one job:  VARIANT=two_stage_goal SEED=0 sbatch --array=0 03_run.sh
 # The scale point:  PRESET=scale VARIANT=two_stage_goal SEED=0 sbatch --array=0 --time 8:00:00 03_run.sh
 set -e
-source "${ENV_SH:-$(dirname "${BASH_SOURCE[0]}")/env.sh}"
+# under sbatch, BASH_SOURCE points into Slurm's spool dir, not the submit dir -- SLURM_SUBMIT_DIR is where env.sh is
+source "${ENV_SH:-${SLURM_SUBMIT_DIR:-$(dirname "${BASH_SOURCE[0]}")}/env.sh}"
 VARIANTS=(two_stage_goal one_stage_goal two_stage_inpaint two_stage_guidance two_stage_nohist two_stage_goal_rollout)
 IDX="${SLURM_ARRAY_TASK_ID:-0}"
 export VARIANT="${VARIANT:-${VARIANTS[$((IDX / 3))]}}"
