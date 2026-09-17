@@ -46,7 +46,9 @@ SUITES = os.environ.get("SUITES", "libero_spatial,libero_object,libero_goal,libe
 HF_REPO = "yifengzhu-hf/LIBERO-datasets"          # the mirror the official LIBERO downloader uses
 ENCODER = os.environ.get("ENCODER", "dinov2")
 TEXT_MODEL = "t5-base"
-POOL, IMG_RES, FPS, FLIP_180 = 4, 224, 20, True
+POOL = int(os.environ.get("POOL", 4))        # vision tokens per camera = 1 + POOL*POOL
+IMG_RES, FPS, FLIP_180 = 224, 20, True
+VIS_SUFFIX = os.environ.get("VIS_SUFFIX", "")  # "_p8" selects the finer-pooled feature files
 HELDOUT_PER_TASK = 5
 
 # tokenizer
@@ -483,8 +485,9 @@ def load_data(vision=True):
     D.body_w = torch.ones(2 * D.NJ, device=DEVICE); D.body_w[D.NJ:] = BODY_VEL_W
     D.hyb = torch.cat([D.exp_pad.reshape(-1, D.EXP), torch.from_numpy(np.load(TOK_DIR / "latents.npy").astype(np.float32)).to(DEVICE)], 1)
     if vision:
-        D.vis_a = torch.from_numpy(np.load(DATA / "vision_agentview.npy")).pin_memory() if DEVICE == "cuda" else torch.from_numpy(np.load(DATA / "vision_agentview.npy"))
-        D.vis_w = torch.from_numpy(np.load(DATA / "vision_wrist.npy")).pin_memory() if DEVICE == "cuda" else torch.from_numpy(np.load(DATA / "vision_wrist.npy"))
+        _a, _w = DATA / f"vision_agentview{VIS_SUFFIX}.npy", DATA / f"vision_wrist{VIS_SUFFIX}.npy"
+        D.vis_a = torch.from_numpy(np.load(_a)); D.vis_w = torch.from_numpy(np.load(_w))
+        if DEVICE == "cuda": D.vis_a = D.vis_a.pin_memory(); D.vis_w = D.vis_w.pin_memory()
         D.DV = D.vis_a.shape[2]
     else:
         D.vis_a = D.vis_w = None; D.DV = D.meta["vision_dim"]
