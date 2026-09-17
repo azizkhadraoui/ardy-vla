@@ -90,7 +90,7 @@ def refresh_rollout_pool(n_batches=8):
     model.train(); log(f"  rollout pool refreshed: {len(rollout_pool)} batches")
     A.wandb_log({"train/step": step_now[0], "train/rollout_pool_batches": len(rollout_pool)})
 
-hist = []; t0 = time.time(); model.train()
+hist, val_hist = [], []; t0 = time.time(); model.train()
 for step in range(1, A.STEPS + 1):
     step_now[0] = step
     if vcfg["rollout"] and (step == 1 or step % A.ROLLOUT_REFRESH == 0): refresh_rollout_pool()
@@ -126,7 +126,9 @@ for step in range(1, A.STEPS + 1):
     opt.zero_grad(set_to_none=True); scaler.scale(loss).backward(); scaler.unscale_(opt); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); scaler.step(opt); scaler.update(); sched.step()
     ema_update(step)
     if A.VAL_EVERY and step % A.VAL_EVERY == 0:
-        vl = val_loss(); hist.append(dict(step=step, val=vl)); log(f"  step {step:6d} held-out diffusion loss {vl:.4f}")
+        # a SEPARATE list: hist rows are consumed positionally by the final summary and by 07_aggregate.py's
+        # training-curve plot, both of which expect every row to carry the training loss keys.
+        vl = val_loss(); val_hist.append(dict(step=step, val=vl)); log(f"  step {step:6d} held-out diffusion loss {vl:.4f}")
         A.wandb_log({"train/step": step, "train/val_loss": vl})
     if step % 250 == 0 or step == 1:
         hist.append(dict(step=step, loss=loss.item(), hyb=l_hyb.item(), goal=l_goal.item(), goal_body=l_goal_body.item(), body=l_body.item(), consist=l_con.item()))
@@ -139,7 +141,7 @@ for step in range(1, A.STEPS + 1):
 raw_sd = model.state_dict()
 save_sd = {k: v.to(raw_sd[k].dtype) for k, v in ema.items()} if ema is not None else raw_sd
 torch.save(dict(state_dict=save_sd, state_dict_raw=(raw_sd if ema is not None else None), ema=A.EMA_DECAY,
-                variant=vcfg, name=VARIANT, seed=SEED, d_model=A.D_MODEL, layers=A.LAYERS, step=A.STEPS, history=hist,
+                variant=vcfg, name=VARIANT, seed=SEED, d_model=A.D_MODEL, layers=A.LAYERS, step=A.STEPS, history=hist, val_history=val_hist,
                 preset=A.PRESET, w_grip=A.W_GRIP, secs=round(time.time() - t0)), dst)
 A.wandb_summary(dict(params_M=round(n_par, 2), final_loss=hist[-1]["loss"], final_hyb=hist[-1]["hyb"], final_body=hist[-1]["body"],
                      final_goal=hist[-1]["goal"], final_goal_body=hist[-1]["goal_body"], final_consist=hist[-1]["consist"],
