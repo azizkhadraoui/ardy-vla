@@ -900,12 +900,14 @@ class LiberoTask:
 class Policy:
     """MPC-style closed-loop policy: measured proprio history -> hybrid tokens through the frozen tokenizer encoder,
     online vision features, optional goal, sample one window, execute EXEC frames, replan."""
-    def __init__(self, D, model, vcfg, enc, task_index, exec_frames=8, project=False, seed_base=None, demo_hist=None, demo_grip=None):
+    def __init__(self, D, model, vcfg, enc, task_index, exec_frames=8, project=False, seed_base=None, demo_hist=None, demo_grip=None, demo_ghist=None):
         self.D, self.model, self.v, self.enc, self.project = D, model, vcfg, enc, project
         self.exec = exec_frames; self.tx = D.text[task_index][None]; self.task_index = task_index
         self.seed_base = seed_base            # Stage 0: deterministic sampling per (task, init, replan)
         self.demo_hist = demo_hist            # Stage 0 ablation: (T,7) demo joints for teacher-forced history
         self.demo_grip = demo_grip            # Stage 0 ablation: (T,) demo gripper COMMAND for the oracle gripper
+        self.demo_ghist = demo_ghist          # ...and (T,2) demo finger positions, so a teacher-forced history is
+                                              # demo motion in BOTH halves of the token rather than half-measured
         self.reset()
 
     def reset(self):
@@ -930,6 +932,9 @@ class Policy:
             idx = np.clip(self.t + np.arange(n), 0, len(self.demo_grip) - 1)
             return self.demo_grip[idx].astype(bool)
         if GRIP_SRC == "head":
+            if getattr(self.model, "out_grip", None) is None:
+                raise RuntimeError("GRIP_SRC=head but this checkpoint has no trained gripper head "
+                                   "(it was trained with W_GRIP=0); width in metres is not a probability")
             want = width > 0.5                                    # width holds sigmoid(logits) in head mode
         elif GRIP_SRC == "hyst":
             want = None
@@ -975,8 +980,11 @@ class Policy:
         if HIST_SOURCE == "demo" and self.demo_hist is not None and self.t > 0:
             # Stage 0 ablation: what the model would see if its own motion had never drifted from the demo.
             n = min(self.t, len(self.demo_hist)); q = self.demo_hist[:n].astype(np.float32)
-            g = np.stack(self.g_hist)[-n:] if len(self.g_hist) >= n else np.stack(self.g_hist)
-            if len(g) < n: g = np.concatenate([np.repeat(g[:1], n - len(g), 0), g])
+            if self.demo_ghist is not None:
+                g = self.demo_ghist[:n].astype(np.float32)
+            else:
+                g = np.stack(self.g_hist)[-n:] if len(self.g_hist) >= n else np.stack(self.g_hist)
+                if len(g) < n: g = np.concatenate([np.repeat(g[:1], n - len(g), 0), g])
         else:
             q = np.stack(self.q_hist); g = np.stack(self.g_hist)
         T = q.shape[0]

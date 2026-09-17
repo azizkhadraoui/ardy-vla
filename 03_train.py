@@ -68,6 +68,22 @@ def val_loss(n_batches=8):
     model.train(); return tot / n_batches
 
 
+def save_ckpt(step, final=False):
+    """One schema for every checkpoint, written atomically.
+
+    The periodic saves used to omit w_grip, so a run interrupted after step 5000 left a checkpoint the
+    evaluators could not build a model for (they size the gripper head from ck["w_grip"]). And a save that is
+    killed midway through a 90k-step run leaves a truncated file where the only copy of the run used to be."""
+    raw_sd = model.state_dict()
+    save_sd = {k: v.to(raw_sd[k].dtype) for k, v in ema.items()} if ema is not None else raw_sd
+    tmp = dst.with_suffix(".tmp")
+    torch.save(dict(state_dict=save_sd, state_dict_raw=(raw_sd if ema is not None else None), ema=A.EMA_DECAY,
+                    variant=vcfg, name=VARIANT, seed=SEED, d_model=A.D_MODEL, layers=A.LAYERS, step=step,
+                    history=hist, val_history=val_hist, preset=A.PRESET, w_grip=A.W_GRIP,
+                    secs=round(time.time() - t0), final=final), tmp)
+    os.replace(tmp, dst)
+
+
 rollout_pool = []; step_now = [0]
 def refresh_rollout_pool(n_batches=8):
     """Self-generated histories: roll the current model forward ROLLOUT_HIST patches from GT history (no goal), then
@@ -137,12 +153,8 @@ for step in range(1, A.STEPS + 1):
                      "train/lr": sched.get_last_lr()[0], "train/grad_scale": scaler.get_scale(),
                      "train/steps_per_s": step / max(time.time() - t0, 1e-6), "train/secs": time.time() - t0})
         if step % 2000 == 0 or step == 1: log(f"  step {step:6d} loss {loss.item():.4f} | hyb {l_hyb.item():.4f} goal {l_goal.item():.4f} goal_body {l_goal_body.item():.4f} body {l_body.item():.4f} consist {l_con.item():.4f} | {time.time()-t0:.0f}s")
-    if step % 5000 == 0: torch.save(dict(state_dict=model.state_dict(), variant=vcfg, name=VARIANT, seed=SEED, d_model=A.D_MODEL, layers=A.LAYERS, step=step, history=hist), dst)
-raw_sd = model.state_dict()
-save_sd = {k: v.to(raw_sd[k].dtype) for k, v in ema.items()} if ema is not None else raw_sd
-torch.save(dict(state_dict=save_sd, state_dict_raw=(raw_sd if ema is not None else None), ema=A.EMA_DECAY,
-                variant=vcfg, name=VARIANT, seed=SEED, d_model=A.D_MODEL, layers=A.LAYERS, step=A.STEPS, history=hist, val_history=val_hist,
-                preset=A.PRESET, w_grip=A.W_GRIP, secs=round(time.time() - t0)), dst)
+    if step % 5000 == 0: save_ckpt(step)
+save_ckpt(A.STEPS, final=True)
 A.wandb_summary(dict(params_M=round(n_par, 2), final_loss=hist[-1]["loss"], final_hyb=hist[-1]["hyb"], final_body=hist[-1]["body"],
                      final_goal=hist[-1]["goal"], final_goal_body=hist[-1]["goal_body"], final_consist=hist[-1]["consist"],
                      minutes=round((time.time() - t0) / 60, 1)), prefix="train/")

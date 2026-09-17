@@ -26,11 +26,12 @@ import numpy as np, torch
 import ardy_vla as A
 from ardy_vla import log
 
+RES_TAG = os.environ.get("RES_TAG", "")     # a throwaway comparison writes its own file instead of overwriting
 D = A.load_data()
 todo = [(os.environ["VARIANT"], int(os.environ.get("SEED", 0)))] if "VARIANT" in os.environ else \
        [(p.stem.rsplit("_s", 1)[0], int(p.stem.rsplit("_s", 1)[1])) for p in sorted(A.CKPT_DIR.glob("*_s*.pt"))]
 for variant, seed in todo:
-    dst = A.RES_DIR / f"openloop_{variant}_s{seed}.json"
+    dst = A.RES_DIR / f"openloop_{variant}_s{seed}{RES_TAG}.json"
     if dst.exists() and os.environ.get("FORCE", "0") != "1": log(f"{dst.name} exists; skipping"); continue
     name = variant.replace("_scale", ""); vcfg = A.VARIANTS[name]
     ck = torch.load(A.CKPT_DIR / f"{variant}_s{seed}.pt", map_location=A.DEVICE, weights_only=False)

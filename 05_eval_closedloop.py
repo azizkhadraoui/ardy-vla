@@ -70,9 +70,13 @@ def run_condition(task, policy, init_idx, proto, record):
     D = task.D; ep = int(task.episodes[init_idx]) if init_idx < len(task.episodes) else int(task.episodes[-1]); rec = dict(protocol=proto, init=init_idx)
     # deterministic sampling per (task, init, protocol) when SEED_SAMPLER=1: the same checkpoint gave 9/20 and
     # 4/20 on one task unseeded, which is larger than most of the effects the stages below are trying to measure.
-    policy.seed_base = (1000003 * task.task_index + 10007 * init_idx + 101 * abs(hash(proto)) % 9973 + 7 * SEED) if A.SEED_SAMPLER else None
+    # NB a fixed table, not hash(proto): Python salts str hashes per process, so the "same" seed differed
+    # between jobs and the seeded runs would not have been comparable -- which is the whole point of seeding.
+    PROTO_ID = {"std": 0, "P4": 1, "P1": 2, "P2": 3, "P3a": 4, "P3b": 5}
+    policy.seed_base = (1000003 * task.task_index + 10007 * init_idx + 101 * PROTO_ID.get(proto, 6) + 7 * SEED) if A.SEED_SAMPLER else None
     s0, T0_ep = int(D.ep_start[ep]), int(D.ep_len[ep])
     policy.demo_hist = D.pr["joint_pos"][s0:s0 + T0_ep] if A.HIST_SOURCE == "demo" else None
+    policy.demo_ghist = D.pr["gripper"][s0:s0 + T0_ep] if A.HIST_SOURCE == "demo" else None
     policy.demo_grip = (D.pr["actions"][s0:s0 + T0_ep, -1] > 0) if A.GRIP_SRC == "oracle" else None
     goal_fn = perturb_fn = None; f_goal = None; box_center = None
     if proto in ("P4", "P1", "P2", "P3b"):
