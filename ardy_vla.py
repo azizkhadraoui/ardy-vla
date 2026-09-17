@@ -49,6 +49,10 @@ TEXT_MODEL = "t5-base"
 POOL = int(os.environ.get("POOL", 4))        # vision tokens per camera = 1 + POOL*POOL
 IMG_RES, FPS, FLIP_180 = 224, 20, True
 VIS_SUFFIX = os.environ.get("VIS_SUFFIX", "")  # "_p8" selects the finer-pooled feature files
+VIS_MODE = os.environ.get("VIS_MODE", "feat")  # feat = frozen DINOv2 tokens | cnn = trained encoder on raw pixels
+CNN_W = int(os.environ.get("CNN_W", 64))       # base width of the trained encoder
+CNN_KP = int(os.environ.get("CNN_KP", 32))     # spatial-softmax keypoints
+CNN_SHIFT = int(os.environ.get("CNN_SHIFT", 8))  # random shift augmentation, px (0 at eval)
 HELDOUT_PER_TASK = 5
 
 # tokenizer
@@ -485,12 +489,19 @@ def load_data(vision=True):
     D.body_w = torch.ones(2 * D.NJ, device=DEVICE); D.body_w[D.NJ:] = BODY_VEL_W
     D.hyb = torch.cat([D.exp_pad.reshape(-1, D.EXP), torch.from_numpy(np.load(TOK_DIR / "latents.npy").astype(np.float32)).to(DEVICE)], 1)
     if vision:
-        _a, _w = DATA / f"vision_agentview{VIS_SUFFIX}.npy", DATA / f"vision_wrist{VIS_SUFFIX}.npy"
-        D.vis_a = torch.from_numpy(np.load(_a)); D.vis_w = torch.from_numpy(np.load(_w))
-        if DEVICE == "cuda": D.vis_a = D.vis_a.pin_memory(); D.vis_w = D.vis_w.pin_memory()
-        D.DV = D.vis_a.shape[2]
+        if VIS_MODE == "cnn":
+            # 33 GB of uint8 frames: memory-mapped, not resident, and gathered per batch like everything else
+            D.vis_a = torch.from_numpy(np.load(DATA / "raw_agentview.npy", mmap_mode="r"))
+            D.vis_w = torch.from_numpy(np.load(DATA / "raw_wrist.npy", mmap_mode="r"))
+            D.DV = int(os.environ.get("CNN_DOUT", 256))
+        else:
+            _a, _w = DATA / f"vision_agentview{VIS_SUFFIX}.npy", DATA / f"vision_wrist{VIS_SUFFIX}.npy"
+            D.vis_a = torch.from_numpy(np.load(_a)); D.vis_w = torch.from_numpy(np.load(_w))
+            if DEVICE == "cuda": D.vis_a = D.vis_a.pin_memory(); D.vis_w = D.vis_w.pin_memory()
+            D.DV = D.vis_a.shape[2]
     else:
-        D.vis_a = D.vis_w = None; D.DV = D.meta["vision_dim"]
+        D.vis_a = D.vis_w = None
+        D.DV = int(os.environ.get("CNN_DOUT", 256)) if VIS_MODE == "cnn" else D.meta["vision_dim"]
     D.text = torch.from_numpy(np.load(DATA / "text_emb.npy")).to(DEVICE); D.DT = D.text.shape[1]
     D.pos_m_t, D.pos_s_t, D.gr_m_t, D.gr_s_t = [torch.tensor(a, device=DEVICE) for a in (D.pos_m, D.pos_s, D.gr_m, D.gr_s)]
     D.p_start_t, D.p_len_t, D.pf_start_t, D.pf_len_t, D.ep_start_t, D.ep_len_t, D.ep_task_t = [torch.from_numpy(a).to(DEVICE) for a in (D.p_start, D.p_len, D.pf_start, D.pf_len, D.ep_start, D.ep_len, D.ep_task)]
@@ -591,8 +602,10 @@ def make_batch(D, eps, B, win_starts=None, hist_len=None, goals="random", pertur
     f0 = D.orig_idx_t[torch.clamp(D.pf_start_t[e] + w * P - VIS_FRAME_OFFSET, min=0)]
     fr = (D.pf_start_t[e] + w * P)[:, None] + torch.arange(C * P, device=DEVICE)
     f0c = f0.cpu()
-    va = D.vis_a[f0c].to(DEVICE, non_blocking=True) if D.vis_a is not None else torch.zeros(B, 1 + POOL * POOL, D.DV, device=DEVICE, dtype=torch.float16)
-    vw = D.vis_w[f0c].to(DEVICE, non_blocking=True) if D.vis_w is not None else torch.zeros_like(va)
+    if D.vis_a is None:
+        va = torch.zeros(B, 1 + POOL * POOL, D.DV, device=DEVICE, dtype=torch.float16); vw = torch.zeros_like(va)
+    else:
+        va = D.vis_a[f0c].to(DEVICE, non_blocking=True); vw = D.vis_w[f0c].to(DEVICE, non_blocking=True)
     b = dict(e=e, w=w, h=h, x0=x0, hist=hist, hist_pad=hist_pad, va=va, vw=vw, tx=D.text[D.ep_task_t[e]], body_tgt=D.body_pad[fr],
              g_val=torch.zeros(B, MAX_GOALS, D.EXP_F, device=DEVICE), g_mask=torch.zeros(B, MAX_GOALS, D.EXP_F, device=DEVICE),
              g_t=torch.zeros(B, MAX_GOALS, dtype=torch.long, device=DEVICE), g_pad=torch.ones(B, MAX_GOALS, dtype=torch.bool, device=DEVICE), g_win=torch.zeros(B, C, D.EXP, device=DEVICE),
@@ -635,6 +648,51 @@ def timestep_embedding(t, dim=128):
     return torch.cat([torch.cos(a), torch.sin(a)], -1)
 
 
+class VisionCNN(nn.Module):
+    """From-scratch encoder over a 128px frame: depthwise-separable stack -> spatial softmax keypoints.
+
+    The frozen DINOv2 features this replaces saturate: a ridge probe places the demo's own grasp point at
+    5.15 cm from the 4x4-pooled tokens and only 4.37 cm from 65 tokens (vision_pooling_probe.json), against
+    ~4 cm objects -- the limit is the representation, not the pooling, so more of the same tokens cannot fix
+    it. Spatial softmax is the part that matters: it turns a feature map into explicit (x, y) coordinates,
+    which is what a grasp needs and what a mean-pooled patch grid destroys. This is the design that reaches
+    0.95 on LIBERO at well under a million parameters (MINERVA), and the one robomimic measures a 35-47%
+"""
+    def __init__(self, w=CNN_W, n_kp=CNN_KP, d_out=256):
+        super().__init__()
+        def blk(ci, co, s):    # depthwise separable: cheap, and enough for 128px table-top scenes
+            return nn.Sequential(nn.Conv2d(ci, ci, 3, s, 1, groups=ci, bias=False), nn.GroupNorm(1, ci), nn.SiLU(),
+                                 nn.Conv2d(ci, co, 1, bias=False), nn.GroupNorm(1, co), nn.SiLU())
+        self.stem = nn.Sequential(nn.Conv2d(3, w, 5, 2, 2, bias=False), nn.GroupNorm(1, w), nn.SiLU())   # 64
+        self.b1, self.b2, self.b3 = blk(w, w, 2), blk(w, 2 * w, 2), blk(2 * w, 2 * w, 1)                 # 32, 16, 16
+        self.to_kp = nn.Conv2d(2 * w, n_kp, 1)
+        self.n_kp, self.d_out = n_kp, d_out
+        self.kp_proj = nn.Linear(3 * n_kp, d_out)              # (x, y, presence) per keypoint
+        self.map_proj = nn.Linear(2 * w, d_out)                # plus a coarse 4x4 grid of pooled features
+
+    def forward(self, u8, shift=0):
+        """u8 (B,H,W,3) uint8 -> (B, 17, d_out): one keypoint token + a 4x4 grid, matching the token budget
+        the frozen path used, so nothing downstream changes shape."""
+        x = u8.permute(0, 3, 1, 2).float().div_(255.0)
+        if FLIP_180: x = torch.flip(x, dims=(2, 3))
+        if shift > 0:                                          # random translation, the augmentation the
+            x = F.pad(x, (shift,) * 4, mode="replicate")        # precomputed-feature pipeline could not do
+            i, j = torch.randint(0, 2 * shift + 1, (2,))
+            x = x[..., i:i + u8.shape[1], j:j + u8.shape[2]]
+        x = (x - 0.5) / 0.25
+        h = self.b3(self.b2(self.b1(self.stem(x))))            # (B, 2w, 16, 16)
+        k = self.to_kp(h)                                      # (B, n_kp, 16, 16)
+        B, K, H, W = k.shape
+        a = k.reshape(B, K, H * W).softmax(-1)
+        gy = torch.linspace(-1, 1, H, device=k.device)[None, None, :, None].expand(1, 1, H, W).reshape(1, 1, -1)
+        gx = torch.linspace(-1, 1, W, device=k.device)[None, None, None, :].expand(1, 1, H, W).reshape(1, 1, -1)
+        px, py = (a * gx).sum(-1), (a * gy).sum(-1)            # expected position of each keypoint
+        pres = k.reshape(B, K, -1).max(-1).values               # how strongly it fired at all
+        kp = self.kp_proj(torch.cat([px, py, pres], -1))[:, None]          # (B, 1, d_out)
+        g = F.adaptive_avg_pool2d(h, POOL).flatten(2).transpose(1, 2)      # (B, POOL^2, 2w)
+        return torch.cat([kp, self.map_proj(g)], 1)
+
+
 class Transformer(nn.Module):
     def __init__(self, d, layers, heads, dropout=0.1):
         super().__init__()
@@ -649,7 +707,9 @@ class HybridDenoiser(nn.Module):
     def __init__(self, D, vcfg, d=D_MODEL, layers=LAYERS, heads=N_HEADS, w_grip=None):
         super().__init__(); self.v = dict(vcfg); self.two_stage, self.use_goals, self.use_vision, self.use_hist = vcfg["two_stage"], vcfg["use_goals"], vcfg["use_vision"], vcfg["use_hist"]
         layers = layers * (1 if self.two_stage else 2)
-        self.text_proj, self.vis_proj, self.cam_emb = nn.Linear(D.DT, d), nn.Linear(D.DV, d), nn.Embedding(2, d)
+        self.text_proj, self.cam_emb = nn.Linear(D.DT, d), nn.Embedding(2, d)
+        self.vis_cnn = VisionCNN(d_out=D.DV) if VIS_MODE == 'cnn' else None
+        self.vis_proj = nn.Linear(D.DV, d)
         self.hist_proj, self.hist_pos = nn.Linear(D.TOK, d), nn.Embedding(H, d)
         self.goal_proj, self.goal_time = nn.Linear(2 * D.EXP_F, d), nn.Embedding((C + FUT) * P, d)
         self.type_emb, self.win_pos = nn.Embedding(5, d), nn.Embedding(C, d); self.t_mlp = nn.Sequential(nn.Linear(128, d), nn.SiLU(), nn.Linear(d, d))
@@ -665,7 +725,13 @@ class HybridDenoiser(nn.Module):
         dm = lambda: (torch.rand(B, device=dev) < COND_DROP) if drop else torch.zeros(B, dtype=torch.bool, device=dev)
         toks, pads = [self.text_proj(b["tx"])[:, None] + self.type_emb.weight[self.TXT]], [dm()[:, None]]
         if self.use_vision:
-            v = torch.cat([self.vis_proj(b["va"].float()) + self.cam_emb.weight[0], self.vis_proj(b["vw"].float()) + self.cam_emb.weight[1]], 1)
+            # uint8 means raw pixels and a trained encoder; float means the frozen precomputed tokens
+            if self.vis_cnn is not None and b["va"].dtype == torch.uint8:
+                sh = CNN_SHIFT if self.training else 0
+                fa, fw = self.vis_cnn(b["va"], sh), self.vis_cnn(b["vw"], sh)
+            else:
+                fa, fw = b["va"].float(), b["vw"].float()
+            v = torch.cat([self.vis_proj(fa) + self.cam_emb.weight[0], self.vis_proj(fw) + self.cam_emb.weight[1]], 1)
             toks.append(v + self.type_emb.weight[self.VIS]); pads.append(dm()[:, None].expand(-1, v.shape[1]))
         if self.use_hist:
             toks.append(self.hist_proj(b["hist"]) + self.hist_pos.weight[None] + self.type_emb.weight[self.HIS]); pads.append(b["hist_pad"])
@@ -1008,7 +1074,12 @@ class Policy:
     def plan(self, goal=None):
         """goal: dict(val (1,11) normalised, mask (1,11), t_frames int from now) or None. Returns joint targets (C*P,7) and gripper flags."""
         D = self.D; hist, pad = self._history_tokens()
-        va = self.enc(self.obs["agentview_image"]); vw = self.enc(self.obs["robot0_eye_in_hand_image"])
+        if getattr(self.model, "vis_cnn", None) is not None:
+            # the trained encoder lives in the checkpoint, so the live frames go in as pixels, unaugmented
+            va = torch.from_numpy(np.ascontiguousarray(self.obs["agentview_image"]))[None].to(DEVICE)
+            vw = torch.from_numpy(np.ascontiguousarray(self.obs["robot0_eye_in_hand_image"]))[None].to(DEVICE)
+        else:
+            va = self.enc(self.obs["agentview_image"]); vw = self.enc(self.obs["robot0_eye_in_hand_image"])
         b = dict(x0=torch.zeros(1, C, D.TOK, device=DEVICE), hist=hist, hist_pad=pad, va=va, vw=vw, tx=self.tx,
                  g_val=torch.zeros(1, MAX_GOALS, D.EXP_F, device=DEVICE), g_mask=torch.zeros(1, MAX_GOALS, D.EXP_F, device=DEVICE),
                  g_t=torch.zeros(1, MAX_GOALS, dtype=torch.long, device=DEVICE), g_pad=torch.ones(1, MAX_GOALS, dtype=torch.bool, device=DEVICE))

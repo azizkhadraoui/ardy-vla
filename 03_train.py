@@ -80,7 +80,7 @@ def save_ckpt(step, final=False):
     torch.save(dict(state_dict=save_sd, state_dict_raw=(raw_sd if ema is not None else None), ema=A.EMA_DECAY,
                     variant=vcfg, name=VARIANT, seed=SEED, d_model=A.D_MODEL, layers=A.LAYERS, step=step,
                     history=hist, val_history=val_hist, preset=A.PRESET, w_grip=A.W_GRIP,
-                    secs=round(time.time() - t0), final=final), tmp)
+                    secs=round(time.time() - t0), final=final, vis_mode=A.VIS_MODE, cnn_dout=D.DV), tmp)
     os.replace(tmp, dst)
 
 
