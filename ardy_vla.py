@@ -93,6 +93,7 @@ ENSEMBLE_K = int(os.environ.get("ENSEMBLE_K", 1))                # >1: temporal 
 ENSEMBLE_M = float(os.environ.get("ENSEMBLE_M", 0.01))           # ACT-style exponential weight exp(-m*age_frames)
 HIST_SOURCE = os.environ.get("HIST_SOURCE", "measured")          # measured | demo (Stage 0 teacher-forced-history ablation)
 SEED_SAMPLER = os.environ.get("SEED_SAMPLER", "0") == "1"        # deterministic per (task, init, replan)
+DECODE_CTX = int(os.environ.get("DECODE_CTX", 0))                # patches of history latent prepended before decoding
 W_GRIP = float(os.environ.get("W_GRIP", 0.0))                    # >0 trains and enables the BCE gripper-command head
 VAL_WINDOWS, HORIZONS, OUT_HORIZON = [8, 16, 24], [4, 8, 12, 16], 8
 
@@ -993,6 +994,7 @@ class Policy:
         q, g = q[T - n:], g[T - n:]; qv = np.gradient(q, axis=0) * FPS
         body = ((np.concatenate([q, qv], 1) - D.body_mean.cpu().numpy()) / D.body_std.cpu().numpy()).astype(np.float32)
         with torch.autocast(**AMP): lat, _ = D.tok.encode(torch.from_numpy(body)[None].to(DEVICE))
+        self.hist_lat = lat.float()          # (1, n_patches, LAT): context for DECODE_CTX, below
         lat = lat.float()[0]
         pos, R = fk_with(D.fk_params, torch.from_numpy(q).to(DEVICE)); r6 = mat_to_rot6d(R)
         ex = torch.cat([(pos - D.pos_m_t) / D.pos_s_t, r6, (torch.from_numpy(g).to(DEVICE) - D.gr_m_t) / D.gr_s_t], 1).reshape(-1, D.EXP)
@@ -1022,7 +1024,18 @@ class Policy:
         out = ddim_sample(D, self.model, b, inpaint=inpaint, guide=guide, cfg=cfg, seed=seed, want_grip=want_grip)
         x, grip_logits = out if want_grip else (out, None)
         self.n_plans += 1
-        body = D.tok.decode(x[..., D.EXP:]).float(); ex = x[0, :, :D.EXP].reshape(-1, D.EXP_F)
+        # The FSQ decoder is causal and was trained on whole episodes, but the policy used to hand it the 4
+        # predicted patches alone. Measured (s0_probe.json): 0.90 deg with full-episode context, 1.26 with a
+        # 128-frame crop, 6.20 deg in isolation -- roughly 6 cm at the EE, on every executed joint. Prepending
+        # the history latents we already computed costs nothing and puts the decoder back in distribution.
+        lat_w = x[..., D.EXP:]
+        ctx = getattr(self, 'hist_lat', None)
+        if DECODE_CTX > 0 and ctx is not None and ctx.shape[1] > 0:
+            k = min(DECODE_CTX, ctx.shape[1])
+            body = D.tok.decode(torch.cat([ctx[:, -k:], lat_w], 1)).float()[:, -C * P:]
+        else:
+            body = D.tok.decode(lat_w).float()
+        ex = x[0, :, :D.EXP].reshape(-1, D.EXP_F)
         q = project_body(D, body, ex[None]) if self.project else (body[..., :D.NJ] * D.body_std[:D.NJ] + D.body_mean[:D.NJ])
         q = q[0].cpu().numpy()
         if grip_logits is not None:
