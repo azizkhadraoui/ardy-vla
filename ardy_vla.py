@@ -63,12 +63,37 @@ _p = dict(long=dict(D_MODEL=384, LAYERS=6, STEPS=30000), quick=dict(D_MODEL=256,
 D_MODEL = int(os.environ.get("D_MODEL", _p["D_MODEL"])); LAYERS = int(os.environ.get("LAYERS", _p["LAYERS"])); STEPS = int(os.environ.get("STEPS", _p["STEPS"]))
 BATCH = int(os.environ.get("BATCH", 128)); LR = float(os.environ.get("LR", 3e-4)); COND_DROP = 0.10
 W_GOAL, W_BODY, W_CONSIST = 2.0, 1.0, 5.0
-HIST_NOISE, HIST_SHIFT_P, HIST_SHIFT_CM = 0.1, 0.33, 3.0
+HIST_NOISE = float(os.environ.get("HIST_NOISE", 0.1))
+HIST_SHIFT_P = float(os.environ.get("HIST_SHIFT_P", 0.33))
+HIST_SHIFT_CM = float(os.environ.get("HIST_SHIFT_CM", 3.0))   # a 3 cm offset on the explicit history teaches the
+                                                              # model its own pose is unreliable to +-3 cm; Stage 2 lowers it
+GOAL_FREE_FRAC = float(os.environ.get("GOAL_FREE_FRAC", 0.25))
+BODY_VEL_W = float(os.environ.get("BODY_VEL_W", 1.0))        # 03: weight of the 7 velocity dims in l_body
+SNAP_IN_LOSS = os.environ.get("SNAP_IN_LOSS", "0") == "1"    # decode the grid-snapped latent (what inference does)
+EMA_DECAY = float(os.environ.get("EMA_DECAY", 0.0))          # >0: keep an EMA of the weights and save THAT
+VAL_EVERY = int(os.environ.get("VAL_EVERY", 0))              # >0: held-out diffusion loss every N steps
+VIS_FRAME_OFFSET = int(os.environ.get("VIS_FRAME_OFFSET", 0))
 ROLLOUT_FRAC, ROLLOUT_REFRESH, ROLLOUT_HIST = 0.25, 2000, 8    # rollout-history variant: share of batches drawn from self-generated histories
 GOAL_CFG = float(os.environ.get("GOAL_CFG", 2.0))
 GUIDE_SCALE = float(os.environ.get("GUIDE_SCALE", 0.3))       # gradient-guidance baseline strength
 SNAP_LATENTS = True
 PROJECT_BODY_STEPS, PROJECT_BODY_LAM = 30, 0.05
+
+# ---- Stage 0/1/2 knobs. Every one defaults to the behaviour that produced the 0.22 baseline, so an
+# unset environment reproduces it exactly; the overnight chain turns them on one stage at a time.
+PROJECT_MODE = os.environ.get("PROJECT_MODE", "adam")            # adam (30-step, 235 ms) | gn (damped Gauss-Newton)
+PROJECT_GN_ITERS = int(os.environ.get("PROJECT_GN_ITERS", 3))
+PROJECT_GN_LAM = float(os.environ.get("PROJECT_GN_LAM", 0.05))
+GRIP_SRC = os.environ.get("GRIP_SRC", "width")                   # width (baseline threshold) | hyst | head | oracle
+GRIP_LO = float(os.environ.get("GRIP_LO", 0.048))                # hysteresis: close below this...
+GRIP_HI = float(os.environ.get("GRIP_HI", 0.058))                # ...open above this
+GRIP_LATCH = int(os.environ.get("GRIP_LATCH", 6))                # frames a close/open decision is held
+GRIP_GATE_CM = float(os.environ.get("GRIP_GATE_CM", 0.0))        # >0: close only once |FK(q_meas) - explicit| is under this
+ENSEMBLE_K = int(os.environ.get("ENSEMBLE_K", 1))                # >1: temporal ensembling over the last K plans
+ENSEMBLE_M = float(os.environ.get("ENSEMBLE_M", 0.01))           # ACT-style exponential weight exp(-m*age_frames)
+HIST_SOURCE = os.environ.get("HIST_SOURCE", "measured")          # measured | demo (Stage 0 teacher-forced-history ablation)
+SEED_SAMPLER = os.environ.get("SEED_SAMPLER", "0") == "1"        # deterministic per (task, init, replan)
+W_GRIP = float(os.environ.get("W_GRIP", 0.0))                    # >0 trains and enables the BCE gripper-command head
 VAL_WINDOWS, HORIZONS, OUT_HORIZON = [8, 16, 24], [4, 8, 12, 16], 8
 
 # variants: two_stage / use_goals / use_vision / use_hist / steering mode / rollout-history training
@@ -449,6 +474,12 @@ def load_data(vision=True):
     D.pf_len = D.p_len * P; D.pf_start = np.concatenate([[0], np.cumsum(D.pf_len)[:-1]])
     orig_idx = np.concatenate([D.ep_start[e] + np.minimum(np.arange(D.pf_len[e]), D.ep_len[e] - 1) for e in range(D.E)])
     D.exp_pad, D.body_pad, D.orig_idx_t = torch.from_numpy(exp_frame[orig_idx]).to(DEVICE), torch.from_numpy(body_frame[orig_idx]).to(DEVICE), torch.from_numpy(orig_idx).to(DEVICE)
+    # the demo gripper COMMAND (+1 close / -1 open), on the padded grid. It has always been in proprio.npz and
+    # was never learned: the policy re-derives open/close from a predicted finger width instead.
+    D.grip_pad = torch.from_numpy((pr["actions"][:, -1] > 0).astype(np.float32)[orig_idx]).to(DEVICE)
+    # per-dimension weights for the decoded-body loss: velocities are never executed, so they should not
+    # compete with joint positions for capacity (the tokenizer itself weights them 0.3).
+    D.body_w = torch.ones(2 * D.NJ, device=DEVICE); D.body_w[D.NJ:] = BODY_VEL_W
     D.hyb = torch.cat([D.exp_pad.reshape(-1, D.EXP), torch.from_numpy(np.load(TOK_DIR / "latents.npy").astype(np.float32)).to(DEVICE)], 1)
     if vision:
         D.vis_a = torch.from_numpy(np.load(DATA / "vision_agentview.npy")).pin_memory() if DEVICE == "cuda" else torch.from_numpy(np.load(DATA / "vision_agentview.npy"))
@@ -498,8 +529,35 @@ def snap_latents(D, z):
     return torch.round(z * hw).clamp(-hw, L - 1 - hw) / hw
 
 
+def _fk_resid(D, q, tgt):
+    """[normalised pos | rot6d] of FK(q) minus the explicit target. (N,7),(N,9) -> (N,9)."""
+    pos, R = fk_with(D.fk_params, q)
+    return torch.cat([(pos - D.pos_m_t) / D.pos_s_t, mat_to_rot6d(R)], -1) - tgt
+
+
+def project_body_gn(D, body_n, E_n, iters=PROJECT_GN_ITERS, lam=PROJECT_GN_LAM):
+    """Same objective as project_body, by damped Gauss-Newton instead of 30 Adam steps.
+
+    The residual it starts from is small (fk_consistency_cm 1.61, rot ~3 deg), i.e. inside the linear regime,
+    so a couple of Newton steps reach the Adam optimum. The Jacobian is 7 batched FK evaluations by finite
+    difference -- deliberately not functorch: no in-place ops to trip over and nothing to fail at 3 a.m."""
+    q0 = (body_n[..., :D.NJ] * D.body_std[:D.NJ] + D.body_mean[:D.NJ]).reshape(-1, D.NJ).detach()
+    E = E_n.reshape(-1, D.EXP_F).detach(); tgt = E[:, :9]
+    q = q0.clone(); eye = torch.eye(D.NJ, device=q.device)[None]; eps = 1e-4
+    with torch.no_grad():
+        for _ in range(max(1, iters)):
+            r = _fk_resid(D, q, tgt)                                                   # (N,9)
+            J = torch.stack([(_fk_resid(D, q + eps * eye[0, i][None], tgt) - r) / eps for i in range(D.NJ)], -1)   # (N,9,7)
+            JT = J.transpose(1, 2)
+            A = JT @ J + (lam + 1e-6) * eye
+            b = JT @ r[..., None] + lam * (q - q0)[..., None]
+            q = q - torch.linalg.solve(A, b)[..., 0]
+    return q.reshape(*body_n.shape[:-1], D.NJ)
+
+
 def project_body(D, body_n, E_n, steps=PROJECT_BODY_STEPS, lam=PROJECT_BODY_LAM):
     """Inference-time consistency projection: q minimising |FK(q) - explicit EE|^2 + lam |q - q_decoded|^2. Reported as a SEPARATE row."""
+    if PROJECT_MODE == "gn": return project_body_gn(D, body_n, E_n)
     q0 = (body_n[..., :D.NJ] * D.body_std[:D.NJ] + D.body_mean[:D.NJ]).reshape(-1, D.NJ).detach(); E = E_n.reshape(-1, D.EXP_F).detach()
     if steps <= 0: return q0.reshape(*body_n.shape[:-1], D.NJ)
     q = q0.clone().requires_grad_(True); opt = torch.optim.Adam([q], lr=0.01)
@@ -525,15 +583,21 @@ def make_batch(D, eps, B, win_starts=None, hist_len=None, goals="random", pertur
         shift = off_n[:, None, None, :].expand(B, 1, P, 3).reshape(B, 1, P * 3)
         idx = (torch.arange(P, device=DEVICE)[:, None] * D.EXP_F + torch.arange(3, device=DEVICE)[None]).reshape(-1)
         hist[:, :, idx] = hist[:, :, idx] + shift * (~hist_pad)[..., None]
-    f0 = D.orig_idx_t[D.pf_start_t[e] + w * P]; fr = (D.pf_start_t[e] + w * P)[:, None] + torch.arange(C * P, device=DEVICE)
+    # inference takes its image at the LAST history frame, so training must too (the window's first frame is 50 ms later)
+    f0 = D.orig_idx_t[torch.clamp(D.pf_start_t[e] + w * P - VIS_FRAME_OFFSET, min=0)]
+    fr = (D.pf_start_t[e] + w * P)[:, None] + torch.arange(C * P, device=DEVICE)
     f0c = f0.cpu()
     va = D.vis_a[f0c].to(DEVICE, non_blocking=True) if D.vis_a is not None else torch.zeros(B, 1 + POOL * POOL, D.DV, device=DEVICE, dtype=torch.float16)
     vw = D.vis_w[f0c].to(DEVICE, non_blocking=True) if D.vis_w is not None else torch.zeros_like(va)
     b = dict(e=e, w=w, h=h, x0=x0, hist=hist, hist_pad=hist_pad, va=va, vw=vw, tx=D.text[D.ep_task_t[e]], body_tgt=D.body_pad[fr],
              g_val=torch.zeros(B, MAX_GOALS, D.EXP_F, device=DEVICE), g_mask=torch.zeros(B, MAX_GOALS, D.EXP_F, device=DEVICE),
-             g_t=torch.zeros(B, MAX_GOALS, dtype=torch.long, device=DEVICE), g_pad=torch.ones(B, MAX_GOALS, dtype=torch.bool, device=DEVICE), g_win=torch.zeros(B, C, D.EXP, device=DEVICE))
+             g_t=torch.zeros(B, MAX_GOALS, dtype=torch.long, device=DEVICE), g_pad=torch.ones(B, MAX_GOALS, dtype=torch.bool, device=DEVICE), g_win=torch.zeros(B, C, D.EXP, device=DEVICE),
+             grip_tgt=D.grip_pad[fr])
     if goals == "random":
-        n_g = torch.randint(0, MAX_GOALS + 1, (B,), device=DEVICE)
+        # GOAL_FREE_FRAC of the batch gets no goal at all: the std evaluation the success number comes from is
+        # entirely goal-free, and at the default Uniform{0..3} only a quarter of training looked like it.
+        n_g = torch.randint(1, MAX_GOALS + 1, (B,), device=DEVICE)
+        n_g = n_g * (torch.rand(B, device=DEVICE) >= GOAL_FREE_FRAC).long()
         for k in range(MAX_GOALS):
             hi = torch.minimum(Np, w + C + FUT); gp = w + (torch.rand(B, device=DEVICE) * (hi - w)).long(); gf = torch.randint(0, P, (B,), device=DEVICE)
             typ = torch.randint(0, 3, (B,), device=DEVICE); m = torch.zeros(B, D.EXP_F, device=DEVICE); m[typ == 0] = 1.0; m[typ == 1, :3] = 1.0; m[typ == 2, 9:] = 1.0
@@ -578,7 +642,7 @@ class Transformer(nn.Module):
 class HybridDenoiser(nn.Module):
     TXT, VIS, HIS, GOL, WIN = range(5)
 
-    def __init__(self, D, vcfg, d=D_MODEL, layers=LAYERS, heads=N_HEADS):
+    def __init__(self, D, vcfg, d=D_MODEL, layers=LAYERS, heads=N_HEADS, w_grip=None):
         super().__init__(); self.v = dict(vcfg); self.two_stage, self.use_goals, self.use_vision, self.use_hist = vcfg["two_stage"], vcfg["use_goals"], vcfg["use_vision"], vcfg["use_hist"]
         layers = layers * (1 if self.two_stage else 2)
         self.text_proj, self.vis_proj, self.cam_emb = nn.Linear(D.DT, d), nn.Linear(D.DV, d), nn.Embedding(2, d)
@@ -587,6 +651,9 @@ class HybridDenoiser(nn.Module):
         self.type_emb, self.win_pos = nn.Embedding(5, d), nn.Embedding(C, d); self.t_mlp = nn.Sequential(nn.Linear(128, d), nn.SiLU(), nn.Linear(d, d))
         self.in1, self.tf1, self.out1 = nn.Linear(D.TOK, d), Transformer(d, layers, heads), nn.Linear(d, D.EXP if self.two_stage else D.TOK)
         if self.two_stage: self.in2, self.tf2, self.out2 = nn.Linear(D.LAT + D.EXP, d), Transformer(d, layers, heads), nn.Linear(d, D.LAT)
+        # auxiliary head: the gripper COMMAND (what the demos actually send) per executed frame, as logits.
+        # It sits outside the diffused token, so the hybrid layout, the goal tokens and every checkpoint stay valid.
+        self.out_grip = nn.Linear(d, P) if (W_GRIP if w_grip is None else w_grip) > 0 else None
         self.EXP = D.EXP
 
     def cond_tokens(self, b, drop):
@@ -602,17 +669,23 @@ class HybridDenoiser(nn.Module):
             toks.append(self.goal_proj(torch.cat([b["g_val"] * b["g_mask"], b["g_mask"]], -1)) + self.goal_time(b["g_t"]) + self.type_emb.weight[self.GOL]); pads.append(b["g_pad"] | dm()[:, None])
         return torch.cat(toks, 1), torch.cat(pads, 1)
 
-    def _run(self, tf, out, tokens, temb, cond, cpad):
+    def _feat(self, tf, tokens, temb, cond, cpad):
         B = tokens.shape[0]; wtok = tokens + self.win_pos.weight[None] + self.type_emb.weight[self.WIN] + temb[:, None]
         pad = torch.cat([cpad, torch.zeros(B, 1 + C, dtype=torch.bool, device=tokens.device)], 1)
-        return out(tf(torch.cat([cond, temb[:, None], wtok], 1), pad)[:, -C:])
+        return tf(torch.cat([cond, temb[:, None], wtok], 1), pad)[:, -C:]
 
-    def forward(self, x_t, t, cond, cpad):
+    def _run(self, tf, out, tokens, temb, cond, cpad): return out(self._feat(tf, tokens, temb, cond, cpad))
+
+    def forward(self, x_t, t, cond, cpad, want_grip=False):
         temb = self.t_mlp(timestep_embedding(t))
-        if not self.two_stage: return self._run(self.tf1, self.out1, self.in1(x_t), temb, cond, cpad)
-        E_hat = self._run(self.tf1, self.out1, self.in1(x_t), temb, cond, cpad)
-        L_hat = self._run(self.tf2, self.out2, self.in2(torch.cat([x_t[..., self.EXP:], E_hat], -1)), temb, cond, cpad)
-        return torch.cat([E_hat, L_hat], -1)
+        if not self.two_stage:
+            h1 = self._feat(self.tf1, self.in1(x_t), temb, cond, cpad); out = self.out1(h1)
+        else:
+            h1 = self._feat(self.tf1, self.in1(x_t), temb, cond, cpad); E_hat = self.out1(h1)
+            L_hat = self._run(self.tf2, self.out2, self.in2(torch.cat([x_t[..., self.EXP:], E_hat], -1)), temb, cond, cpad)
+            out = torch.cat([E_hat, L_hat], -1)
+        if not want_grip: return out
+        return out, (self.out_grip(h1) if self.out_grip is not None else None)
 
 
 def ckpt_path(variant, seed): return CKPT_DIR / f"{variant}_s{seed}.pt"
@@ -620,7 +693,7 @@ def ckpt_path(variant, seed): return CKPT_DIR / f"{variant}_s{seed}.pt"
 
 def load_model(D, variant, seed):
     ck = torch.load(ckpt_path(variant, seed), map_location=DEVICE, weights_only=False)
-    model = HybridDenoiser(D, ck["variant"], d=ck.get("d_model", D_MODEL), layers=ck.get("layers", LAYERS)).to(DEVICE); model.load_state_dict(ck["state_dict"]); model.eval()
+    model = HybridDenoiser(D, ck["variant"], d=ck.get("d_model", D_MODEL), layers=ck.get("layers", LAYERS), w_grip=ck.get("w_grip", 0.0)).to(DEVICE); model.load_state_dict(ck["state_dict"]); model.eval()
     return model, ck
 
 
@@ -631,7 +704,7 @@ _tt = torch.arange(T_DIFF + 1, device=DEVICE) / T_DIFF; _ab = torch.cos((_tt + 0
 def q_sample(x0, t, noise): return AB[t].sqrt()[:, None, None] * x0 + (1 - AB[t]).sqrt()[:, None, None] * noise
 
 
-def ddim_sample(D, model, b, inpaint=None, guide=None, cfg=1.0, steps=SAMPLE_STEPS):
+def ddim_sample(D, model, b, inpaint=None, guide=None, cfg=1.0, steps=SAMPLE_STEPS, seed=None, want_grip=False):
     """x0-prediction DDIM. inpaint: dict(mask,val) replacing explicit entries of x0_hat (DiSCo-style baseline).
     guide: dict(mask,val) gradient guidance on the explicit goal error through the network (classifier-guidance baseline).
     cfg: classifier-free guidance on goal tokens (goal tokens are the last MAX_GOALS conditioning tokens)."""
@@ -640,7 +713,12 @@ def ddim_sample(D, model, b, inpaint=None, guide=None, cfg=1.0, steps=SAMPLE_STE
         cond, cpad = model.cond_tokens(b, drop=False)
         use_cfg = cfg != 1.0 and model.use_goals and bool((~b["g_pad"]).any())
         if use_cfg: cpad_u = cpad.clone(); cpad_u[:, -MAX_GOALS:] = True
-    x = torch.randn(B, C, D.TOK, device=DEVICE); ts = torch.linspace(T_DIFF - 1, 0, steps, device=DEVICE).round().long()
+    if seed is not None:
+        g = torch.Generator(device=DEVICE); g.manual_seed(int(seed) % (2 ** 63 - 1))
+        x = torch.randn(B, C, D.TOK, device=DEVICE, generator=g)
+    else:
+        x = torch.randn(B, C, D.TOK, device=DEVICE)
+    ts = torch.linspace(T_DIFF - 1, 0, steps, device=DEVICE).round().long()
     for i, t in enumerate(ts):
         if guide is not None:
             x = x.detach().requires_grad_(True)
@@ -653,14 +731,15 @@ def ddim_sample(D, model, b, inpaint=None, guide=None, cfg=1.0, steps=SAMPLE_STE
             x = x.detach()
         else:
             with torch.no_grad(), torch.autocast(**AMP):
-                x0_hat = model(x, t.expand(B), cond, cpad).float()
+                out = model(x, t.expand(B), cond, cpad, want_grip=want_grip)
+                x0_hat, grip_logits = (out[0].float(), out[1]) if want_grip else (out.float(), None)
                 if use_cfg: x0_u = model(x, t.expand(B), cond, cpad_u).float(); x0_hat = x0_u + cfg * (x0_hat - x0_u)
         with torch.no_grad():
             x0_hat[..., D.EXP:] = x0_hat[..., D.EXP:].clamp(-1, 1)
             if inpaint is not None: x0_hat[..., :D.EXP] = torch.where(inpaint["mask"] > 0, inpaint["val"], x0_hat[..., :D.EXP])
             if i == len(ts) - 1:
                 if SNAP_LATENTS: x0_hat[..., D.EXP:] = snap_latents(D, x0_hat[..., D.EXP:])
-                return x0_hat
+                return (x0_hat, grip_logits) if want_grip else x0_hat
             eps = (x - AB[t].sqrt() * x0_hat) / (1 - AB[t]).sqrt(); tp = ts[i + 1]; x = AB[tp].sqrt() * x0_hat + (1 - AB[tp]).sqrt() * eps
 
 
@@ -821,18 +900,86 @@ class LiberoTask:
 class Policy:
     """MPC-style closed-loop policy: measured proprio history -> hybrid tokens through the frozen tokenizer encoder,
     online vision features, optional goal, sample one window, execute EXEC frames, replan."""
-    def __init__(self, D, model, vcfg, enc, task_index, exec_frames=8, project=False):
+    def __init__(self, D, model, vcfg, enc, task_index, exec_frames=8, project=False, seed_base=None, demo_hist=None, demo_grip=None):
         self.D, self.model, self.v, self.enc, self.project = D, model, vcfg, enc, project
-        self.exec = exec_frames; self.tx = D.text[task_index][None]; self.reset()
+        self.exec = exec_frames; self.tx = D.text[task_index][None]; self.task_index = task_index
+        self.seed_base = seed_base            # Stage 0: deterministic sampling per (task, init, replan)
+        self.demo_hist = demo_hist            # Stage 0 ablation: (T,7) demo joints for teacher-forced history
+        self.demo_grip = demo_grip            # Stage 0 ablation: (T,) demo gripper COMMAND for the oracle gripper
+        self.reset()
 
-    def reset(self): self.q_hist, self.g_hist, self.pending, self.t = [], [], [], 0
+    def reset(self):
+        self.q_hist, self.g_hist, self.pending, self.t = [], [], [], 0
+        self.n_plans = 0; self.ens = []       # ensembling buffer: (start_frame, q (C*P,7), width (C*P,))
+        self.grip_state = False; self.grip_hold = 0
 
     def observe(self, obs):
         self.q_hist.append(np.asarray(obs["robot0_joint_pos"], np.float32)); self.g_hist.append(np.asarray(obs["robot0_gripper_qpos"], np.float32)[:2])
         self.obs = obs
 
+    def _grip_command(self, width, ee_plan):
+        """Per-executed-frame open/close command. 'width' is the predicted finger width of each planned frame.
+
+        width  : the 0.22 baseline -- close iff width < threshold, decided fresh every frame. Replaying the demos'
+                 own trajectories through this rule costs libero_object 0.84 -> 0.30, so it is the first thing fixed.
+        hyst   : hysteresis + latch, so a close survives the controller's ~0.16 s lag instead of chattering.
+        oracle : the demo's own command (Stage 0 ablation -- an upper bound, not a policy).
+        head   : the trained BCE command head (Stage 2); 'width' carries its probability in that mode."""
+        D = self.D; n = len(width)
+        if GRIP_SRC == "oracle" and self.demo_grip is not None:
+            idx = np.clip(self.t + np.arange(n), 0, len(self.demo_grip) - 1)
+            return self.demo_grip[idx].astype(bool)
+        if GRIP_SRC == "head":
+            want = width > 0.5                                    # width holds sigmoid(logits) in head mode
+        elif GRIP_SRC == "hyst":
+            want = None
+        else:
+            return width < D.gripper_threshold
+        out = np.zeros(n, bool)
+        gated = True
+        if GRIP_GATE_CM > 0 and len(self.q_hist) and ee_plan is not None:
+            q_now = torch.from_numpy(self.q_hist[-1])[None].to(DEVICE)
+            pos, _ = fk_with(D.fk_params, q_now)
+            gated = float(np.linalg.norm(pos[0].cpu().numpy() - ee_plan[0])) * 100 < GRIP_GATE_CM
+        for k in range(n):
+            if self.grip_hold > 0:
+                self.grip_hold -= 1
+            else:
+                new = self.grip_state
+                if want is not None:
+                    new = bool(want[k])
+                elif width[k] < GRIP_LO: new = True
+                elif width[k] > GRIP_HI: new = False
+                if new and not self.grip_state and not gated: new = False      # wait for the arm to arrive
+                if new != self.grip_state: self.grip_state = new; self.grip_hold = GRIP_LATCH
+            out[k] = self.grip_state
+        return out
+
+    def _ensemble(self, q, width, start):
+        """ACT-style temporal ensembling: average the overlapping frames of the last K plans, weighting a plan by
+        exp(-m * age_in_frames). Without it a shorter EXEC just means more independent noise draws per second."""
+        self.ens.append((start, q, width))
+        if len(self.ens) > ENSEMBLE_K: self.ens.pop(0)
+        n = q.shape[0]; acc_q = np.zeros_like(q); acc_w = np.zeros_like(width); wsum = np.zeros(n, np.float32)
+        for (s0, qq, ww) in self.ens:
+            off = start - s0                                       # frames of qq already consumed
+            m = min(n, qq.shape[0] - off)
+            if m <= 0: continue
+            wt = float(np.exp(-ENSEMBLE_M * off))
+            acc_q[:m] += wt * qq[off:off + m]; acc_w[:m] += wt * ww[off:off + m]; wsum[:m] += wt
+        wsum = np.maximum(wsum, 1e-6)
+        return acc_q / wsum[:, None], acc_w / wsum
+
     def _history_tokens(self):
-        D = self.D; q = np.stack(self.q_hist); g = np.stack(self.g_hist); T = q.shape[0]
+        D = self.D
+        if HIST_SOURCE == "demo" and self.demo_hist is not None and self.t > 0:
+            # Stage 0 ablation: what the model would see if its own motion had never drifted from the demo.
+            n = min(self.t, len(self.demo_hist)); q = self.demo_hist[:n].astype(np.float32)
+            g = np.stack(self.g_hist)[-n:] if len(self.g_hist) >= n else np.stack(self.g_hist)
+            if len(g) < n: g = np.concatenate([np.repeat(g[:1], n - len(g), 0), g])
+        else:
+            q = np.stack(self.q_hist); g = np.stack(self.g_hist)
+        T = q.shape[0]
         n = min(H * P, (T // P) * P)
         if n == 0: return torch.zeros(1, H, D.TOK, device=DEVICE), torch.ones(1, H, dtype=torch.bool, device=DEVICE)
         q, g = q[T - n:], g[T - n:]; qv = np.gradient(q, axis=0) * FPS
@@ -862,11 +1009,21 @@ class Policy:
                 mask[:, pi, f * D.EXP_F:(f + 1) * D.EXP_F] = goal["mask"]; val[:, pi, f * D.EXP_F:(f + 1) * D.EXP_F] = goal["val"]
                 if self.v["steer"] == "inpaint": inpaint = dict(mask=mask, val=val)
                 else: guide = dict(mask=mask, val=val)
-        x = ddim_sample(D, self.model, b, inpaint=inpaint, guide=guide, cfg=cfg)
+        seed = None if self.seed_base is None else self.seed_base + 7919 * self.n_plans
+        want_grip = GRIP_SRC == "head" and getattr(self.model, "out_grip", None) is not None
+        out = ddim_sample(D, self.model, b, inpaint=inpaint, guide=guide, cfg=cfg, seed=seed, want_grip=want_grip)
+        x, grip_logits = out if want_grip else (out, None)
+        self.n_plans += 1
         body = D.tok.decode(x[..., D.EXP:]).float(); ex = x[0, :, :D.EXP].reshape(-1, D.EXP_F)
         q = project_body(D, body, ex[None]) if self.project else (body[..., :D.NJ] * D.body_std[:D.NJ] + D.body_mean[:D.NJ])
-        q = q[0].cpu().numpy(); width = ((ex[:, 9:] * D.gr_s_t + D.gr_m_t)[:, 0] - (ex[:, 9:] * D.gr_s_t + D.gr_m_t)[:, 1]).cpu().numpy()
-        return q, width < D.gripper_threshold, unnorm_pos(D, ex[:, :3]).cpu().numpy()
+        q = q[0].cpu().numpy()
+        if grip_logits is not None:
+            width = torch.sigmoid(grip_logits.float()).reshape(-1).cpu().numpy()      # probability, consumed by GRIP_SRC='head'
+        else:
+            width = ((ex[:, 9:] * D.gr_s_t + D.gr_m_t)[:, 0] - (ex[:, 9:] * D.gr_s_t + D.gr_m_t)[:, 1]).cpu().numpy()
+        ee_plan = unnorm_pos(D, ex[:, :3]).cpu().numpy()
+        if ENSEMBLE_K > 1: q, width = self._ensemble(q, width, self.t)
+        return q, self._grip_command(width, ee_plan), ee_plan
 
 
 def run_episode(task, policy, init_idx, goal_fn=None, max_steps=500, perturb_fn=None, record=False):
@@ -874,10 +1031,15 @@ def run_episode(task, policy, init_idx, goal_fn=None, max_steps=500, perturb_fn=
     Returns dict(success, steps, ee_path (T,3), grip (T,), plan_paths [list of (16,3)], frames {cam: [..]})."""
     obs = task.reset(init_idx); policy.reset(); policy.observe(obs)
     ee, grip, plans, frames = [], [], [], {c: [] for c in task.record_cams}
+    plan_fk, plan_q = [], []
     success, t = False, 0
     while t < max_steps and not success:
         goal = goal_fn(t) if goal_fn else None
+        policy.t = t                                                   # the policy needs the absolute frame for ensembling / oracle gripper
         q_plan, g_plan, ee_plan = policy.plan(goal); plans.append((t, ee_plan))
+        fkp, _ = fk_with(task.D.fk_params, torch.from_numpy(np.asarray(q_plan, np.float32)).to(DEVICE))
+        plan_fk.append(fkp.cpu().numpy())                              # FK of the planned joints: separates stream
+        plan_q.append(np.asarray(q_plan, np.float32))                  # inconsistency from controller lag
         for k in range(policy.exec):
             if perturb_fn: perturb_fn(task, t)
             obs, done, _ = task.step_to(q_plan[k], bool(g_plan[k])); policy.observe(obs)
@@ -888,4 +1050,5 @@ def run_episode(task, policy, init_idx, goal_fn=None, max_steps=500, perturb_fn=
             t += 1
             if done: success = True; break
             if t >= max_steps: break
-    return dict(success=success, steps=t, ee_path=np.array(ee), grip=np.array(grip), plans=plans, frames=frames)
+    return dict(success=success, steps=t, ee_path=np.array(ee), grip=np.array(grip), plans=plans, frames=frames,
+                plan_fk=np.array(plan_fk), plan_q=np.array(plan_q))

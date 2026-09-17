@@ -39,6 +39,35 @@ scaler = torch.amp.GradScaler("cuda", enabled=A.USE_AMP)
 log(f"=== {VARIANT} seed {SEED}: {n_par:.2f}M params, d={A.D_MODEL} layers={A.LAYERS} steps={A.STEPS} batch={A.BATCH}  {vcfg}")
 A.wandb_init("train", VARIANT, SEED, config=dict(params_M=round(n_par, 2), ckpt=dst.name, n_train_ep=len(D.train_eps), n_val_ep=len(D.val_eps)))
 
+# Exponential moving average of the weights. Diffusion training is noisy at the end of a cosine schedule and the
+# eval loads "state_dict", so when EMA is on that key holds the averaged weights and the raw ones are kept beside it.
+ema = {k: v.detach().clone().float() for k, v in model.state_dict().items()} if A.EMA_DECAY > 0 else None
+
+
+def ema_update(step):
+    if ema is None: return
+    d = min(A.EMA_DECAY, (1.0 + step) / (10.0 + step))
+    with torch.no_grad():
+        for k, v in model.state_dict().items():
+            if v.dtype.is_floating_point: ema[k].mul_(d).add_(v.float(), alpha=1.0 - d)
+            else: ema[k] = v.detach().clone().float()
+
+
+@torch.no_grad()
+def val_loss(n_batches=8):
+    """Held-out diffusion loss: the only signal that says whether a longer schedule is still buying anything."""
+    model.eval(); tot = 0.0
+    gen = torch.Generator(device=A.DEVICE); gen.manual_seed(1234)
+    for _ in range(n_batches):
+        bb = A.make_batch(D, D.val_eps, A.BATCH, goals="random" if vcfg["use_goals"] else None)
+        tt = torch.randint(0, A.T_DIFF, (bb["x0"].shape[0],), device=A.DEVICE, generator=gen)
+        xx = A.q_sample(bb["x0"], tt, torch.randn(bb["x0"].shape, device=A.DEVICE, generator=gen))
+        with torch.autocast(**AMP):
+            cond, cpad = model.cond_tokens(bb, drop=False); pred = model(xx, tt, cond, cpad).float()
+        tot += F.mse_loss(pred, bb["x0"]).item()
+    model.train(); return tot / n_batches
+
+
 rollout_pool = []; step_now = [0]
 def refresh_rollout_pool(n_batches=8):
     """Self-generated histories: roll the current model forward ROLLOUT_HIST patches from GT history (no goal), then
@@ -78,25 +107,40 @@ for step in range(1, A.STEPS + 1):
         b = A.make_batch(D, D.train_eps, A.BATCH, goals="random" if vcfg["use_goals"] else None, perturb=True); B = A.BATCH
     t = torch.randint(0, A.T_DIFF, (B,), device=DEVICE); x_t = A.q_sample(b["x0"], t, torch.randn_like(b["x0"]))
     with torch.autocast(**AMP):
-        cond, cpad = model.cond_tokens(b, drop=True); x0_hat = model(x_t, t, cond, cpad).float()
+        cond, cpad = model.cond_tokens(b, drop=True)
+        out = model(x_t, t, cond, cpad, want_grip=A.W_GRIP > 0)
+        x0_hat, grip_logits = (out[0].float(), out[1]) if A.W_GRIP > 0 else (out.float(), None)
         E_hat, L_hat = x0_hat[..., :D.EXP], x0_hat[..., D.EXP:]; E_, L_ = b["x0"][..., :D.EXP], b["x0"][..., D.EXP:]
         l_hyb = F.mse_loss(E_hat, E_) + F.mse_loss(L_hat, L_); l_goal = ((E_hat - E_) ** 2 * b["g_win"]).sum() / b["g_win"].sum().clamp(min=1.0)
-        body_hat = D.tok.decode(L_hat).float(); l_body = F.mse_loss(body_hat, b["body_tgt"])
+        # inference decodes the FSQ-SNAPPED latent (ddim_sample snaps on the last step); training decoded the
+        # continuous one, so the decoder was never trained on the codes it is actually given. Straight-through
+        # keeps the gradient while feeding the decoder the snapped value.
+        L_dec = L_hat + (A.snap_latents(D, L_hat) - L_hat).detach() if A.SNAP_IN_LOSS else L_hat
+        body_hat = D.tok.decode(L_dec).float(); l_body = (((body_hat - b["body_tgt"]) ** 2) * D.body_w).mean()
+        l_grip = F.binary_cross_entropy_with_logits(grip_logits.reshape(B, -1).float(), b["grip_tgt"]) if grip_logits is not None else torch.zeros((), device=DEVICE)
     fk_pos, fk_r6 = A.fk_from_body(D, body_hat); Ef = E_hat.reshape(B, C * P, D.EXP_F); Eg = E_.reshape(B, C * P, D.EXP_F); fk_pos_n = (fk_pos - D.pos_m_t) / D.pos_s_t
     l_con = F.mse_loss(fk_pos_n, Ef[..., :3]) + F.mse_loss(fk_r6, Ef[..., 3:9])
     gm = b["g_win"].reshape(B, C * P, D.EXP_F)
     l_goal_body = (((fk_pos_n - Eg[..., :3]) ** 2 * gm[..., :3]).sum() + ((fk_r6 - Eg[..., 3:9]) ** 2 * gm[..., 3:9]).sum()) / gm[..., :9].sum().clamp(min=1.0)
-    loss = l_hyb + A.W_GOAL * (l_goal + l_goal_body) + A.W_BODY * l_body + A.W_CONSIST * l_con
+    loss = l_hyb + A.W_GOAL * (l_goal + l_goal_body) + A.W_BODY * l_body + A.W_CONSIST * l_con + A.W_GRIP * l_grip
     opt.zero_grad(set_to_none=True); scaler.scale(loss).backward(); scaler.unscale_(opt); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); scaler.step(opt); scaler.update(); sched.step()
+    ema_update(step)
+    if A.VAL_EVERY and step % A.VAL_EVERY == 0:
+        vl = val_loss(); hist.append(dict(step=step, val=vl)); log(f"  step {step:6d} held-out diffusion loss {vl:.4f}")
+        A.wandb_log({"train/step": step, "train/val_loss": vl})
     if step % 250 == 0 or step == 1:
         hist.append(dict(step=step, loss=loss.item(), hyb=l_hyb.item(), goal=l_goal.item(), goal_body=l_goal_body.item(), body=l_body.item(), consist=l_con.item()))
-        A.wandb_log({"train/step": step, "train/loss": loss.item(), "train/hyb": l_hyb.item(), "train/goal": l_goal.item(),
+        A.wandb_log({"train/step": step, "train/grip": float(l_grip), "train/loss": loss.item(), "train/hyb": l_hyb.item(), "train/goal": l_goal.item(),
                      "train/goal_body": l_goal_body.item(), "train/body": l_body.item(), "train/consist": l_con.item(),
                      "train/lr": sched.get_last_lr()[0], "train/grad_scale": scaler.get_scale(),
                      "train/steps_per_s": step / max(time.time() - t0, 1e-6), "train/secs": time.time() - t0})
         if step % 2000 == 0 or step == 1: log(f"  step {step:6d} loss {loss.item():.4f} | hyb {l_hyb.item():.4f} goal {l_goal.item():.4f} goal_body {l_goal_body.item():.4f} body {l_body.item():.4f} consist {l_con.item():.4f} | {time.time()-t0:.0f}s")
     if step % 5000 == 0: torch.save(dict(state_dict=model.state_dict(), variant=vcfg, name=VARIANT, seed=SEED, d_model=A.D_MODEL, layers=A.LAYERS, step=step, history=hist), dst)
-torch.save(dict(state_dict=model.state_dict(), variant=vcfg, name=VARIANT, seed=SEED, d_model=A.D_MODEL, layers=A.LAYERS, step=A.STEPS, history=hist, preset=A.PRESET, secs=round(time.time() - t0)), dst)
+raw_sd = model.state_dict()
+save_sd = {k: v.to(raw_sd[k].dtype) for k, v in ema.items()} if ema is not None else raw_sd
+torch.save(dict(state_dict=save_sd, state_dict_raw=(raw_sd if ema is not None else None), ema=A.EMA_DECAY,
+                variant=vcfg, name=VARIANT, seed=SEED, d_model=A.D_MODEL, layers=A.LAYERS, step=A.STEPS, history=hist,
+                preset=A.PRESET, w_grip=A.W_GRIP, secs=round(time.time() - t0)), dst)
 A.wandb_summary(dict(params_M=round(n_par, 2), final_loss=hist[-1]["loss"], final_hyb=hist[-1]["hyb"], final_body=hist[-1]["body"],
                      final_goal=hist[-1]["goal"], final_goal_body=hist[-1]["goal_body"], final_consist=hist[-1]["consist"],
                      minutes=round((time.time() - t0) / 60, 1)), prefix="train/")

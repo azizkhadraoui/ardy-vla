@@ -43,14 +43,15 @@ PROTOCOLS = os.environ.get("PROTOCOLS", "std,P4,P1,P2,P3").split(","); EXEC = in
 RECORD = os.environ.get("RECORD", "0") == "1"; RECORD_TASKS, RECORD_N = int(os.environ.get("RECORD_TASKS", 2)), int(os.environ.get("RECORD_N", 2))
 MAX_STEPS = dict(libero_spatial=220, libero_object=280, libero_goal=300, libero_10=520)
 T0, HORIZON, LIFT, BOX = 20, 32, 0.08, 0.03                    # protocol constants: 1 s, 1.6 s, 8 cm, 6 cm box
-dst = A.RES_DIR / f"closedloop_{VARIANT}_s{SEED}{'_proj' if PROJECT else ''}.json"
+TAG = os.environ.get("TAG", "")
+dst = A.RES_DIR / f"closedloop_{VARIANT}_s{SEED}{'_proj' if PROJECT else ''}{TAG}.json"
 if dst.exists() and os.environ.get("FORCE", "0") != "1": log(f"{dst.name} exists; skipping"); sys.exit(0)
 
 D = A.load_data(vision=False)
 ck = torch.load(A.CKPT_DIR / f"{VARIANT}_s{SEED}.pt", map_location=DEVICE, weights_only=False)
-model = A.HybridDenoiser(D, ck["variant"], d=ck.get("d_model", A.D_MODEL), layers=ck.get("layers", A.LAYERS)).to(DEVICE); model.load_state_dict(ck["state_dict"]); model.eval()
+model = A.HybridDenoiser(D, ck["variant"], d=ck.get("d_model", A.D_MODEL), layers=ck.get("layers", A.LAYERS), w_grip=ck.get("w_grip", 0.0)).to(DEVICE); model.load_state_dict(ck["state_dict"]); model.eval()
 enc = A.OnlineEncoder(D.meta)
-records = []; epi_dir = A.EPI_DIR / f"{VARIANT}_s{SEED}"; epi_dir.mkdir(exist_ok=True)
+records = []; epi_dir = A.EPI_DIR / f"{VARIANT}_s{SEED}{TAG}"; epi_dir.mkdir(exist_ok=True)
 A.wandb_init("closedloop", VARIANT, SEED, config=dict(ckpt_step=ck.get("step"), n_init=N_INIT, n_init_proto=N_INIT_PROTO,
              protocols=PROTOCOLS, cl_suites=CL_SUITES, proto_suites=PROTO_SUITES, exec_frames=EXEC, project=PROJECT))
 
@@ -67,6 +68,12 @@ def demo_goal(D, ep, frame, mask_kind):
 
 def run_condition(task, policy, init_idx, proto, record):
     D = task.D; ep = int(task.episodes[init_idx]) if init_idx < len(task.episodes) else int(task.episodes[-1]); rec = dict(protocol=proto, init=init_idx)
+    # deterministic sampling per (task, init, protocol) when SEED_SAMPLER=1: the same checkpoint gave 9/20 and
+    # 4/20 on one task unseeded, which is larger than most of the effects the stages below are trying to measure.
+    policy.seed_base = (1000003 * task.task_index + 10007 * init_idx + 101 * abs(hash(proto)) % 9973 + 7 * SEED) if A.SEED_SAMPLER else None
+    s0, T0_ep = int(D.ep_start[ep]), int(D.ep_len[ep])
+    policy.demo_hist = D.pr["joint_pos"][s0:s0 + T0_ep] if A.HIST_SOURCE == "demo" else None
+    policy.demo_grip = (D.pr["actions"][s0:s0 + T0_ep, -1] > 0) if A.GRIP_SRC == "oracle" else None
     goal_fn = perturb_fn = None; f_goal = None; box_center = None
     if proto in ("P4", "P1", "P2", "P3b"):
         kind = dict(P4="full", P1="pos", P2="grip", P3b="full")[proto]; f_goal = T0 + (HORIZON if proto != "P3b" else 30)
@@ -101,12 +108,14 @@ def run_condition(task, policy, init_idx, proto, record):
                             goal_pos=w(np.array(rec.get("goal_pos", [np.nan] * 3))), goal_frame=f_goal if f_goal is not None else -1,
                             box_center=w(np.array(box_center if box_center is not None else [np.nan] * 3)),
                             plans=w(np.array([p[1] for p in out["plans"]])), plan_t=np.array([p[0] for p in out["plans"]]), language=task.info["language"],
+                            plan_fk=w(out["plan_fk"]), plan_q=out["plan_q"],
                             **{f"frames_{c}": np.stack(v) for c, v in out["frames"].items() if len(v)})
     return rec
 
 
 t_all = time.time()
-for ti, info in enumerate(D.meta["tasks"]):
+MAXTASKS = int(os.environ.get("MAXTASKS", 0))          # smoke tests: stop after this many tasks
+for ti, info in list(enumerate(D.meta["tasks"]))[:MAXTASKS or None]:
     protos = [p for p in PROTOCOLS if p == "std" and info["suite"] in CL_SUITES] + \
              [q for p in PROTOCOLS if p != "std" and info["suite"] in PROTO_SUITES for q in (["P3a", "P3b"] if p == "P3" else [p])]
     if not protos: continue
@@ -138,7 +147,11 @@ def summarise(recs):
         out[proto] = s
     return out
 summary = dict(all=summarise(records), per_suite={s: summarise([r for r in records if r["suite"] == s]) for s in dict.fromkeys(r["suite"] for r in records)})
-json.dump(dict(variant=VARIANT, seed=SEED, project=PROJECT, exec_frames=EXEC, n_init=N_INIT, n_init_proto=N_INIT_PROTO, records=records, summary=summary, secs=round(time.time() - t_all), partial=False), open(dst, "w"), indent=1)
+json.dump(dict(variant=VARIANT, seed=SEED, project=PROJECT, exec_frames=EXEC, n_init=N_INIT, n_init_proto=N_INIT_PROTO,
+               knobs=dict(grip_src=A.GRIP_SRC, grip_lo=A.GRIP_LO, grip_hi=A.GRIP_HI, grip_latch=A.GRIP_LATCH, grip_gate_cm=A.GRIP_GATE_CM,
+                          project_mode=A.PROJECT_MODE, ensemble_k=A.ENSEMBLE_K, ensemble_m=A.ENSEMBLE_M,
+                          hist_source=A.HIST_SOURCE, seeded=A.SEED_SAMPLER, sample_steps=A.SAMPLE_STEPS),
+               records=records, summary=summary, secs=round(time.time() - t_all), partial=False), open(dst, "w"), indent=1)
 print("\n" + "=" * 100); print(f" {VARIANT} seed {SEED}{' +projection' if PROJECT else ''}   ({(time.time()-t_all)/3600:.1f} h)")
 print(f" {'condition':10s}{'n':>6s}{'success':>10s}{'adherence cm':>14s}{'grip mm':>10s}{'collision':>11s}{'accel cm':>10s}"); print("-" * 100)
 for p, s in summary["all"].items():

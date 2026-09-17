@@ -34,7 +34,7 @@ for variant, seed in todo:
     if dst.exists() and os.environ.get("FORCE", "0") != "1": log(f"{dst.name} exists; skipping"); continue
     name = variant.replace("_scale", ""); vcfg = A.VARIANTS[name]
     ck = torch.load(A.CKPT_DIR / f"{variant}_s{seed}.pt", map_location=A.DEVICE, weights_only=False)
-    model = A.HybridDenoiser(D, ck["variant"], d=ck.get("d_model", A.D_MODEL), layers=ck.get("layers", A.LAYERS)).to(A.DEVICE); model.load_state_dict(ck["state_dict"]); model.eval()
+    model = A.HybridDenoiser(D, ck["variant"], d=ck.get("d_model", A.D_MODEL), layers=ck.get("layers", A.LAYERS), w_grip=ck.get("w_grip", 0.0)).to(A.DEVICE); model.load_state_dict(ck["state_dict"]); model.eval()
     A.wandb_init("openloop", variant, seed, config=dict(ckpt_step=ck.get("step")))
     A.seed_all(1000 + seed); t0 = time.time()
     r = A.evaluate_openloop(D, model, vcfg, D.val_eps)
