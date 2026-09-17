@@ -35,9 +35,9 @@ EOF
 # refuse to queue a second copy of a job that is already pending or running
 sub () {
   local n="$1"; shift; local dep="${1:-}"
-  if squeue -u "$USER" -h -n "$n" -o "%T" 2>/dev/null | grep -qE "PENDING|RUNNING"; then
-    echo "ALREADY-QUEUED"; return 0
-  fi
+  # return the EXISTING id, not a word: the caller feeds this straight into --dependency=afterok:
+  local have; have=$(squeue -u "$USER" -h -n "$n" -o "%i %T" 2>/dev/null | awk '$2=="PENDING"||$2=="RUNNING"{print $1; exit}')
+  if [ -n "$have" ]; then echo "$have"; return 0; fi
   sbatch ${dep:+--dependency=afterok:$dep} "jobs/$n.sh" | awk '{print $NF}'
 }
 
@@ -158,9 +158,7 @@ for j in s0_probe s0_4step s0_kpsweep s0_oracle s0_hist s0_seeded_base s1_grippe
   eval "ID_$j=\$id"
 done
 eval "T=\$ID_s2_train"
-if [ "$T" != "ALREADY-QUEUED" ]; then
-  echo "$(printf '%-18s' s2_openloop) $(sub s2_openloop "$T")"
-  echo "$(printf '%-18s' s2_closed)   $(sub s2_closed "$T")"
-fi
+echo "$(printf '%-18s' s2_openloop) $(sub s2_openloop "$T")"
+echo "$(printf '%-18s' s2_closed)   $(sub s2_closed "$T")"
 echo
 squeue -u "$USER" -o "%.10i %.16j %.9T %.10M %.12l %.20E"
