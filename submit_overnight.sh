@@ -119,10 +119,18 @@ if [ "$MODE" = "smoke" ]; then
 fi
 
 # ---------------------------------------------------------------- the DAG
-SMOKE=$(sub smoke)
-echo "smoke              $SMOKE   (everything below waits on it)"
+# "after <jobid>" hangs the DAG off a smoke test that is already running or has already passed, so a launch that
+# was interrupted (a dropped VPN, a closed laptop) does not have to re-run the 25-minute gate.
+if [ "$MODE" = "after" ]; then
+  SMOKE="${2:?usage: submit_overnight.sh after <smoke-jobid>|none}"
+  [ "$SMOKE" = "none" ] && SMOKE=""
+  echo "hanging the DAG off smoke job ${SMOKE:-<none: smoke already passed>}"
+else
+  SMOKE=$(sub smoke)
+  echo "smoke              $SMOKE   (everything below waits on it)"
+fi
 for j in s0_probe s0_4step s0_kpsweep s0_oracle s0_hist s0_seeded_base s1_gripper s1_full s2_train; do
-  id=$(sub "$j" "$SMOKE"); echo "$(printf '%-18s' "$j") $id   after smoke"
+  id=$(sub "$j" "$SMOKE"); echo "$(printf '%-18s' "$j") $id   after ${SMOKE:-nothing}"
   eval "ID_$j=$id"
 done
 eval "T=\$ID_s2_train"
