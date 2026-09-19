@@ -55,6 +55,8 @@ CNN_KP = int(os.environ.get("CNN_KP", 32))     # spatial-softmax keypoints
 CNN_SHIFT = int(os.environ.get("CNN_SHIFT", 8))  # random shift augmentation, px (0 at eval)
 N_OBS = int(os.environ.get("N_OBS", 1))          # observation frames per replan (2 lets the model SEE change)
 LONG_W = float(os.environ.get("LONG_W", 1.0))    # oversampling weight for libero_10 episodes (MINERVA uses 3x)
+MEM_K = int(os.environ.get("MEM_K", 0))          # >0: recurrent visual memory over MEM_K past frames
+MEM_DT = int(os.environ.get("MEM_DT", 40))       # spacing between them, frames (MEM_K x MEM_DT = horizon covered)
 NOOP_TRIM = float(os.environ.get("NOOP_TRIM", 0.0))  # >0: drop leading/trailing frames whose joint motion is
                                                      # under this rad/frame -- OpenVLA calls no-op filtering crucial
 EXCLUDE_FAILED = os.environ.get("EXCLUDE_FAILED", "")  # json from replay_demos.py: demos the actuation path cannot reproduce
@@ -653,6 +655,16 @@ def make_batch(D, eps, B, win_starts=None, hist_len=None, goals="random", pertur
         va = torch.zeros(B, 1 + POOL * POOL, D.DV, device=DEVICE, dtype=torch.float16); vw = torch.zeros_like(va)
     else:
         va = D.vis_a[f0c].to(DEVICE, non_blocking=True); vw = D.vis_w[f0c].to(DEVICE, non_blocking=True)
+    vmem = None
+    if MEM_K > 0 and D.vis_a is not None and D.vis_a.dtype != torch.uint8:
+        # oldest -> newest, clamped to the episode start so early windows repeat the first frame
+        base = D.pf_start_t[e] + w * P
+        offs = torch.arange(MEM_K - 1, -1, -1, device=DEVICE) * MEM_DT
+        idx = D.orig_idx_t[torch.clamp(base[:, None] - offs[None], min=0)]
+        st = D.ep_start_t[D.ep_task_t[e]] if False else torch.as_tensor(D.ep_start, device=DEVICE)[e]
+        idx = torch.maximum(idx, st[:, None]).cpu()
+        vm = D.vis_a[idx.reshape(-1)].to(DEVICE, non_blocking=True)          # (B*K, NT, DV)
+        vmem = vm.float().mean(1).reshape(B, MEM_K, -1)                      # one vector per frame
     if N_OBS > 1 and D.vis_a is not None:
         # the history tokens are proprioceptive, so nothing in them says an object has already been moved.
         # A second frame OBS_DT back is the cheapest way for the model to perceive that change.
@@ -666,7 +678,7 @@ def make_batch(D, eps, B, win_starts=None, hist_len=None, goals="random", pertur
     b = dict(e=e, w=w, h=h, x0=x0, hist=hist, hist_pad=hist_pad, va=va, vw=vw, tx=D.text[D.ep_task_t[e]], body_tgt=D.body_pad[fr],
              g_val=torch.zeros(B, MAX_GOALS, D.EXP_F, device=DEVICE), g_mask=torch.zeros(B, MAX_GOALS, D.EXP_F, device=DEVICE),
              g_t=torch.zeros(B, MAX_GOALS, dtype=torch.long, device=DEVICE), g_pad=torch.ones(B, MAX_GOALS, dtype=torch.bool, device=DEVICE), g_win=torch.zeros(B, C, D.EXP, device=DEVICE),
-             grip_tgt=D.grip_pad[fr], ra=ra, rw=rw, va2=va2, vw2=vw2)
+             grip_tgt=D.grip_pad[fr], ra=ra, rw=rw, va2=va2, vw2=vw2, vmem=vmem)
     if goals == "random":
         # GOAL_FREE_FRAC of the batch gets no goal at all: the std evaluation the success number comes from is
         # entirely goal-free, and at the default Uniform{0..3} only a quarter of training looked like it.
@@ -703,6 +715,28 @@ def put_goal(D, b, slot, val, mask, t_frames):
 def timestep_embedding(t, dim=128):
     half = dim // 2; a = t.float()[:, None] * torch.exp(-math.log(10000) * torch.arange(half, device=t.device) / half)[None]
     return torch.cat([torch.cos(a), torch.sin(a)], -1)
+
+
+class VisionMemory(nn.Module):
+    """A recurrent summary of how the SCENE has changed, to sit beside the proprioceptive history.
+
+    The history tokens are joint positions through the FSQ tokenizer: they describe the arm, and nothing in
+    them can say that the soup is already in the basket. That is why the six libero_10 tasks which repeat an
+    action on a second object sit at 0.00-0.30 while sequential tasks with different actions reach 0.95 -- the
+    model cannot tell which of two objects it has already moved.
+
+    A GRU over MEM_K frames spaced MEM_DT apart covers MEM_K*MEM_DT frames of scene history (default 8 x 40 =
+    320 frames = 16 s, longer than the mean long-suite demo) and compresses it to one token. The recurrence is
+    recomputed each replan rather than carried across them, so training keeps its random-window sampling and
+    the policy stays reproducible."""
+    def __init__(self, d_in, d, layers=1):
+        super().__init__()
+        self.gru = nn.GRU(d_in, d, num_layers=layers, batch_first=True)
+        self.norm = nn.LayerNorm(d)
+
+    def forward(self, seq):        # (B, K, d_in) oldest -> newest
+        out, _ = self.gru(seq)
+        return self.norm(out[:, -1:])          # (B, 1, d): the state after seeing the whole window
 
 
 class VisionCNN(nn.Module):
@@ -759,7 +793,7 @@ class Transformer(nn.Module):
 
 
 class HybridDenoiser(nn.Module):
-    TXT, VIS, HIS, GOL, WIN = range(5)
+    TXT, VIS, HIS, GOL, WIN, MEM = range(6)
 
     def __init__(self, D, vcfg, d=D_MODEL, layers=LAYERS, heads=N_HEADS, w_grip=None):
         super().__init__(); self.v = dict(vcfg); self.two_stage, self.use_goals, self.use_vision, self.use_hist = vcfg["two_stage"], vcfg["use_goals"], vcfg["use_vision"], vcfg["use_hist"]
@@ -768,10 +802,11 @@ class HybridDenoiser(nn.Module):
         self.vis_cnn = VisionCNN(d_out=D.DV if VIS_MODE == 'cnn' else 256) if VIS_MODE in ('cnn', 'both') else None
         self.cnn_proj = nn.Linear(256, d) if VIS_MODE == 'both' else None
         self.obs_emb = nn.Embedding(2, d) if N_OBS > 1 else None     # now vs earlier
+        self.vis_mem = VisionMemory(D.DV, d) if MEM_K > 0 else None
         self.vis_proj = nn.Linear(D.DV, d)
         self.hist_proj, self.hist_pos = nn.Linear(D.TOK, d), nn.Embedding(H, d)
         self.goal_proj, self.goal_time = nn.Linear(2 * D.EXP_F, d), nn.Embedding((C + FUT) * P, d)
-        self.type_emb, self.win_pos = nn.Embedding(5, d), nn.Embedding(C, d); self.t_mlp = nn.Sequential(nn.Linear(128, d), nn.SiLU(), nn.Linear(d, d))
+        self.type_emb, self.win_pos = nn.Embedding(6, d), nn.Embedding(C, d); self.t_mlp = nn.Sequential(nn.Linear(128, d), nn.SiLU(), nn.Linear(d, d))
         self.in1, self.tf1, self.out1 = nn.Linear(D.TOK, d), Transformer(d, layers, heads), nn.Linear(d, D.EXP if self.two_stage else D.TOK)
         if self.two_stage: self.in2, self.tf2, self.out2 = nn.Linear(D.LAT + D.EXP, d), Transformer(d, layers, heads), nn.Linear(d, D.LAT)
         # auxiliary head: the gripper COMMAND (what the demos actually send) per executed frame, as logits.
@@ -802,6 +837,8 @@ class HybridDenoiser(nn.Module):
                 ca, cw = self.vis_cnn(b["ra"], sh), self.vis_cnn(b["rw"], sh)
                 v = torch.cat([v, self.cnn_proj(ca) + self.cam_emb.weight[0], self.cnn_proj(cw) + self.cam_emb.weight[1]], 1)
             toks.append(v + self.type_emb.weight[self.VIS]); pads.append(dm()[:, None].expand(-1, v.shape[1]))
+        if self.vis_mem is not None and b.get("vmem") is not None:
+            toks.append(self.vis_mem(b["vmem"].float()) + self.type_emb.weight[self.MEM]); pads.append(dm()[:, None])
         if self.use_hist:
             toks.append(self.hist_proj(b["hist"]) + self.hist_pos.weight[None] + self.type_emb.weight[self.HIS]); pads.append(b["hist_pad"])
         if self.use_goals:   # goal tokens are always the LAST MAX_GOALS conditioning tokens (CFG relies on this)
@@ -1157,12 +1194,17 @@ class Policy:
             va, vw = raw("agentview_image"), raw("robot0_eye_in_hand_image")
         else:
             va = self.enc(self.obs["agentview_image"]); vw = self.enc(self.obs["robot0_eye_in_hand_image"])
-        if N_OBS > 1:
+        if N_OBS > 1 or MEM_K > 0:
             self.obs_buf.append((va, vw))
             k = max(0, len(self.obs_buf) - 1 - OBS_DT // max(1, self.exec))
             va2, vw2 = self.obs_buf[k]
+        vmem = None
+        if MEM_K > 0 and va.dtype != torch.uint8:
+            step = max(1, MEM_DT // max(1, self.exec))
+            picks = [max(0, len(self.obs_buf) - 1 - j * step) for j in range(MEM_K - 1, -1, -1)]
+            vmem = torch.stack([self.obs_buf[i][0].float().mean(1)[0] for i in picks])[None]
         b = dict(x0=torch.zeros(1, C, D.TOK, device=DEVICE), hist=hist, hist_pad=pad, va=va, vw=vw, ra=ra, rw=rw,
-                 va2=va2, vw2=vw2, tx=self.tx,
+                 va2=va2, vw2=vw2, vmem=vmem, tx=self.tx,
                  g_val=torch.zeros(1, MAX_GOALS, D.EXP_F, device=DEVICE), g_mask=torch.zeros(1, MAX_GOALS, D.EXP_F, device=DEVICE),
                  g_t=torch.zeros(1, MAX_GOALS, dtype=torch.long, device=DEVICE), g_pad=torch.ones(1, MAX_GOALS, dtype=torch.bool, device=DEVICE))
         inpaint = guide = None; cfg = 1.0
