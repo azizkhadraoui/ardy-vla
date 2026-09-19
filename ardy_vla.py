@@ -53,6 +53,8 @@ VIS_MODE = os.environ.get("VIS_MODE", "feat")  # feat = frozen DINOv2 | cnn = tr
 CNN_W = int(os.environ.get("CNN_W", 64))       # base width of the trained encoder
 CNN_KP = int(os.environ.get("CNN_KP", 32))     # spatial-softmax keypoints
 CNN_SHIFT = int(os.environ.get("CNN_SHIFT", 8))  # random shift augmentation, px (0 at eval)
+N_OBS = int(os.environ.get("N_OBS", 1))          # observation frames per replan (2 lets the model SEE change)
+OBS_DT = int(os.environ.get("OBS_DT", 40))       # how far back the second frame is taken, in frames (2 s)
 HELDOUT_PER_TASK = 5
 
 # tokenizer
@@ -609,12 +611,20 @@ def make_batch(D, eps, B, win_starts=None, hist_len=None, goals="random", pertur
         va = torch.zeros(B, 1 + POOL * POOL, D.DV, device=DEVICE, dtype=torch.float16); vw = torch.zeros_like(va)
     else:
         va = D.vis_a[f0c].to(DEVICE, non_blocking=True); vw = D.vis_w[f0c].to(DEVICE, non_blocking=True)
+    if N_OBS > 1 and D.vis_a is not None:
+        # the history tokens are proprioceptive, so nothing in them says an object has already been moved.
+        # A second frame OBS_DT back is the cheapest way for the model to perceive that change.
+        f_prev = D.orig_idx_t[torch.clamp(D.pf_start_t[e] + w * P - VIS_FRAME_OFFSET - OBS_DT, min=0)].cpu()
+        f_prev = torch.maximum(f_prev, torch.as_tensor(D.ep_start)[D.ep_task_t[e].cpu()])
+        va2 = D.vis_a[f_prev].to(DEVICE, non_blocking=True); vw2 = D.vis_w[f_prev].to(DEVICE, non_blocking=True)
+    else:
+        va2 = vw2 = None
     ra = D.raw_a[f0c].to(DEVICE, non_blocking=True) if getattr(D, "raw_a", None) is not None and VIS_MODE == "both" else None
     rw = D.raw_w[f0c].to(DEVICE, non_blocking=True) if getattr(D, "raw_w", None) is not None and VIS_MODE == "both" else None
     b = dict(e=e, w=w, h=h, x0=x0, hist=hist, hist_pad=hist_pad, va=va, vw=vw, tx=D.text[D.ep_task_t[e]], body_tgt=D.body_pad[fr],
              g_val=torch.zeros(B, MAX_GOALS, D.EXP_F, device=DEVICE), g_mask=torch.zeros(B, MAX_GOALS, D.EXP_F, device=DEVICE),
              g_t=torch.zeros(B, MAX_GOALS, dtype=torch.long, device=DEVICE), g_pad=torch.ones(B, MAX_GOALS, dtype=torch.bool, device=DEVICE), g_win=torch.zeros(B, C, D.EXP, device=DEVICE),
-             grip_tgt=D.grip_pad[fr], ra=ra, rw=rw)
+             grip_tgt=D.grip_pad[fr], ra=ra, rw=rw, va2=va2, vw2=vw2)
     if goals == "random":
         # GOAL_FREE_FRAC of the batch gets no goal at all: the std evaluation the success number comes from is
         # entirely goal-free, and at the default Uniform{0..3} only a quarter of training looked like it.
@@ -715,6 +725,7 @@ class HybridDenoiser(nn.Module):
         self.text_proj, self.cam_emb = nn.Linear(D.DT, d), nn.Embedding(2, d)
         self.vis_cnn = VisionCNN(d_out=D.DV if VIS_MODE == 'cnn' else 256) if VIS_MODE in ('cnn', 'both') else None
         self.cnn_proj = nn.Linear(256, d) if VIS_MODE == 'both' else None
+        self.obs_emb = nn.Embedding(2, d) if N_OBS > 1 else None     # now vs earlier
         self.vis_proj = nn.Linear(D.DV, d)
         self.hist_proj, self.hist_pos = nn.Linear(D.TOK, d), nn.Embedding(H, d)
         self.goal_proj, self.goal_time = nn.Linear(2 * D.EXP_F, d), nn.Embedding((C + FUT) * P, d)
@@ -738,6 +749,11 @@ class HybridDenoiser(nn.Module):
             else:
                 fa, fw = b["va"].float(), b["vw"].float()
             v = torch.cat([self.vis_proj(fa) + self.cam_emb.weight[0], self.vis_proj(fw) + self.cam_emb.weight[1]], 1)
+            if self.obs_emb is not None: v = v + self.obs_emb.weight[0]
+            if self.obs_emb is not None and b.get("va2") is not None:
+                v2 = torch.cat([self.vis_proj(b["va2"].float()) + self.cam_emb.weight[0],
+                                self.vis_proj(b["vw2"].float()) + self.cam_emb.weight[1]], 1) + self.obs_emb.weight[1]
+                v = torch.cat([v, v2], 1)
             if self.vis_cnn is not None and b.get("ra") is not None:
                 # both: the trained encoder localises (object 0.445 -> 0.700) and the frozen one carries the
                 # semantics that disambiguate which object (spatial 0.845 -> 0.755 when it is removed)
@@ -995,6 +1011,7 @@ class Policy:
         self.q_hist, self.g_hist, self.pending, self.t = [], [], [], 0
         self.n_plans = 0; self.ens = []       # ensembling buffer: (start_frame, q (C*P,7), width (C*P,))
         self.grip_state = False; self.grip_hold = 0
+        self.obs_buf = []                      # past vision tokens, for N_OBS > 1
 
     def observe(self, obs):
         self.q_hist.append(np.asarray(obs["robot0_joint_pos"], np.float32)); self.g_hist.append(np.asarray(obs["robot0_gripper_qpos"], np.float32)[:2])
@@ -1086,6 +1103,7 @@ class Policy:
         """goal: dict(val (1,11) normalised, mask (1,11), t_frames int from now) or None. Returns joint targets (C*P,7) and gripper flags."""
         D = self.D; hist, pad = self._history_tokens()
         raw = lambda k: torch.from_numpy(np.ascontiguousarray(self.obs[k]))[None].to(DEVICE)
+        va2 = vw2 = None
         ra = rw = None
         if VIS_MODE == "both":
             # both token sets: the frozen encoder for semantics, the trained one for localisation. Sending
@@ -1097,7 +1115,12 @@ class Policy:
             va, vw = raw("agentview_image"), raw("robot0_eye_in_hand_image")
         else:
             va = self.enc(self.obs["agentview_image"]); vw = self.enc(self.obs["robot0_eye_in_hand_image"])
-        b = dict(x0=torch.zeros(1, C, D.TOK, device=DEVICE), hist=hist, hist_pad=pad, va=va, vw=vw, ra=ra, rw=rw, tx=self.tx,
+        if N_OBS > 1:
+            self.obs_buf.append((va, vw))
+            k = max(0, len(self.obs_buf) - 1 - OBS_DT // max(1, self.exec))
+            va2, vw2 = self.obs_buf[k]
+        b = dict(x0=torch.zeros(1, C, D.TOK, device=DEVICE), hist=hist, hist_pad=pad, va=va, vw=vw, ra=ra, rw=rw,
+                 va2=va2, vw2=vw2, tx=self.tx,
                  g_val=torch.zeros(1, MAX_GOALS, D.EXP_F, device=DEVICE), g_mask=torch.zeros(1, MAX_GOALS, D.EXP_F, device=DEVICE),
                  g_t=torch.zeros(1, MAX_GOALS, dtype=torch.long, device=DEVICE), g_pad=torch.ones(1, MAX_GOALS, dtype=torch.bool, device=DEVICE))
         inpaint = guide = None; cfg = 1.0
