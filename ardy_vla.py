@@ -1085,13 +1085,19 @@ class Policy:
     def plan(self, goal=None):
         """goal: dict(val (1,11) normalised, mask (1,11), t_frames int from now) or None. Returns joint targets (C*P,7) and gripper flags."""
         D = self.D; hist, pad = self._history_tokens()
-        if getattr(self.model, "vis_cnn", None) is not None:
+        raw = lambda k: torch.from_numpy(np.ascontiguousarray(self.obs[k]))[None].to(DEVICE)
+        ra = rw = None
+        if VIS_MODE == "both":
+            # both token sets: the frozen encoder for semantics, the trained one for localisation. Sending
+            # only pixels here would feed 256-d CNN tokens into the 384-d frozen projection.
+            va, vw = self.enc(self.obs["agentview_image"]), self.enc(self.obs["robot0_eye_in_hand_image"])
+            ra, rw = raw("agentview_image"), raw("robot0_eye_in_hand_image")
+        elif getattr(self.model, "vis_cnn", None) is not None:
             # the trained encoder lives in the checkpoint, so the live frames go in as pixels, unaugmented
-            va = torch.from_numpy(np.ascontiguousarray(self.obs["agentview_image"]))[None].to(DEVICE)
-            vw = torch.from_numpy(np.ascontiguousarray(self.obs["robot0_eye_in_hand_image"]))[None].to(DEVICE)
+            va, vw = raw("agentview_image"), raw("robot0_eye_in_hand_image")
         else:
             va = self.enc(self.obs["agentview_image"]); vw = self.enc(self.obs["robot0_eye_in_hand_image"])
-        b = dict(x0=torch.zeros(1, C, D.TOK, device=DEVICE), hist=hist, hist_pad=pad, va=va, vw=vw, tx=self.tx,
+        b = dict(x0=torch.zeros(1, C, D.TOK, device=DEVICE), hist=hist, hist_pad=pad, va=va, vw=vw, ra=ra, rw=rw, tx=self.tx,
                  g_val=torch.zeros(1, MAX_GOALS, D.EXP_F, device=DEVICE), g_mask=torch.zeros(1, MAX_GOALS, D.EXP_F, device=DEVICE),
                  g_t=torch.zeros(1, MAX_GOALS, dtype=torch.long, device=DEVICE), g_pad=torch.ones(1, MAX_GOALS, dtype=torch.bool, device=DEVICE))
         inpaint = guide = None; cfg = 1.0
