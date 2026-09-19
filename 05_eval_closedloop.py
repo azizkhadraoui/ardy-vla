@@ -49,7 +49,7 @@ if dst.exists() and os.environ.get("FORCE", "0") != "1": log(f"{dst.name} exists
 
 D = A.load_data(vision=False)
 ck = torch.load(A.CKPT_DIR / f"{VARIANT}_s{SEED}.pt", map_location=DEVICE, weights_only=False)
-model = A.HybridDenoiser(D, ck["variant"], d=ck.get("d_model", A.D_MODEL), layers=ck.get("layers", A.LAYERS), w_grip=ck.get("w_grip", 0.0)).to(DEVICE); model.load_state_dict(ck["state_dict"]); model.eval()
+model = A.HybridDenoiser(D, ck["variant"], d=ck.get("d_model", A.D_MODEL), layers=ck.get("layers", A.LAYERS), w_grip=ck.get("w_grip", 0.0)).to(DEVICE); A.load_compat(model, ck["state_dict"]); model.eval()
 enc = A.OnlineEncoder(D.meta)
 records = []; epi_dir = A.EPI_DIR / f"{VARIANT}_s{SEED}{TAG}"; epi_dir.mkdir(exist_ok=True)
 A.wandb_init("closedloop", VARIANT, SEED, config=dict(ckpt_step=ck.get("step"), n_init=N_INIT, n_init_proto=N_INIT_PROTO,

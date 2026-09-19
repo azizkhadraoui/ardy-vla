@@ -867,9 +867,27 @@ class HybridDenoiser(nn.Module):
 def ckpt_path(variant, seed): return CKPT_DIR / f"{variant}_s{seed}.pt"
 
 
+def load_compat(model, sd):
+    """Load a state dict that may predate a later-added conditioning token type.
+
+    type_emb grew from 5 rows to 6 when VisionMemory added its own token type. Every checkpoint trained
+    before that has 5, and the extra row is only ever indexed when vis_mem exists, so copying the old rows
+    in and leaving the new one at init is exactly equivalent for those models."""
+    tgt = model.state_dict()
+    for k in ("type_emb.weight",):
+        if k in sd and k in tgt and sd[k].shape != tgt[k].shape:
+            n = min(sd[k].shape[0], tgt[k].shape[0])
+            merged = tgt[k].clone(); merged[:n] = sd[k][:n].to(merged.dtype); sd = dict(sd); sd[k] = merged
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    missing = [m for m in missing if not m.startswith(("vis_mem.", "cnn_proj.", "obs_emb."))]
+    if missing or unexpected:
+        raise RuntimeError(f"checkpoint does not match the model: missing {missing}, unexpected {unexpected}")
+    return model
+
+
 def load_model(D, variant, seed):
     ck = torch.load(ckpt_path(variant, seed), map_location=DEVICE, weights_only=False)
-    model = HybridDenoiser(D, ck["variant"], d=ck.get("d_model", D_MODEL), layers=ck.get("layers", LAYERS), w_grip=ck.get("w_grip", 0.0)).to(DEVICE); model.load_state_dict(ck["state_dict"]); model.eval()
+    model = HybridDenoiser(D, ck["variant"], d=ck.get("d_model", D_MODEL), layers=ck.get("layers", LAYERS), w_grip=ck.get("w_grip", 0.0)).to(DEVICE); load_compat(model, ck["state_dict"]); model.eval()
     return model, ck
 
 
