@@ -49,7 +49,7 @@ TEXT_MODEL = "t5-base"
 POOL = int(os.environ.get("POOL", 4))        # vision tokens per camera = 1 + POOL*POOL
 IMG_RES, FPS, FLIP_180 = 224, 20, True
 VIS_SUFFIX = os.environ.get("VIS_SUFFIX", "")  # "_p8" selects the finer-pooled feature files
-VIS_MODE = os.environ.get("VIS_MODE", "feat")  # feat = frozen DINOv2 tokens | cnn = trained encoder on raw pixels
+VIS_MODE = os.environ.get("VIS_MODE", "feat")  # feat = frozen DINOv2 | cnn = trained encoder | both = concatenated
 CNN_W = int(os.environ.get("CNN_W", 64))       # base width of the trained encoder
 CNN_KP = int(os.environ.get("CNN_KP", 32))     # spatial-softmax keypoints
 CNN_SHIFT = int(os.environ.get("CNN_SHIFT", 8))  # random shift augmentation, px (0 at eval)
@@ -489,10 +489,13 @@ def load_data(vision=True):
     D.body_w = torch.ones(2 * D.NJ, device=DEVICE); D.body_w[D.NJ:] = BODY_VEL_W
     D.hyb = torch.cat([D.exp_pad.reshape(-1, D.EXP), torch.from_numpy(np.load(TOK_DIR / "latents.npy").astype(np.float32)).to(DEVICE)], 1)
     if vision:
+        D.raw_a = D.raw_w = None
+        if VIS_MODE in ("cnn", "both"):
+            # 31 GB of uint8 frames: memory-mapped, not resident, and gathered per batch like everything else
+            D.raw_a = torch.from_numpy(np.load(DATA / "raw_agentview.npy", mmap_mode="r"))
+            D.raw_w = torch.from_numpy(np.load(DATA / "raw_wrist.npy", mmap_mode="r"))
         if VIS_MODE == "cnn":
-            # 33 GB of uint8 frames: memory-mapped, not resident, and gathered per batch like everything else
-            D.vis_a = torch.from_numpy(np.load(DATA / "raw_agentview.npy", mmap_mode="r"))
-            D.vis_w = torch.from_numpy(np.load(DATA / "raw_wrist.npy", mmap_mode="r"))
+            D.vis_a, D.vis_w = D.raw_a, D.raw_w
             D.DV = int(os.environ.get("CNN_DOUT", 256))
         else:
             _a, _w = DATA / f"vision_agentview{VIS_SUFFIX}.npy", DATA / f"vision_wrist{VIS_SUFFIX}.npy"
@@ -606,10 +609,12 @@ def make_batch(D, eps, B, win_starts=None, hist_len=None, goals="random", pertur
         va = torch.zeros(B, 1 + POOL * POOL, D.DV, device=DEVICE, dtype=torch.float16); vw = torch.zeros_like(va)
     else:
         va = D.vis_a[f0c].to(DEVICE, non_blocking=True); vw = D.vis_w[f0c].to(DEVICE, non_blocking=True)
+    ra = D.raw_a[f0c].to(DEVICE, non_blocking=True) if getattr(D, "raw_a", None) is not None and VIS_MODE == "both" else None
+    rw = D.raw_w[f0c].to(DEVICE, non_blocking=True) if getattr(D, "raw_w", None) is not None and VIS_MODE == "both" else None
     b = dict(e=e, w=w, h=h, x0=x0, hist=hist, hist_pad=hist_pad, va=va, vw=vw, tx=D.text[D.ep_task_t[e]], body_tgt=D.body_pad[fr],
              g_val=torch.zeros(B, MAX_GOALS, D.EXP_F, device=DEVICE), g_mask=torch.zeros(B, MAX_GOALS, D.EXP_F, device=DEVICE),
              g_t=torch.zeros(B, MAX_GOALS, dtype=torch.long, device=DEVICE), g_pad=torch.ones(B, MAX_GOALS, dtype=torch.bool, device=DEVICE), g_win=torch.zeros(B, C, D.EXP, device=DEVICE),
-             grip_tgt=D.grip_pad[fr])
+             grip_tgt=D.grip_pad[fr], ra=ra, rw=rw)
     if goals == "random":
         # GOAL_FREE_FRAC of the batch gets no goal at all: the std evaluation the success number comes from is
         # entirely goal-free, and at the default Uniform{0..3} only a quarter of training looked like it.
@@ -708,7 +713,8 @@ class HybridDenoiser(nn.Module):
         super().__init__(); self.v = dict(vcfg); self.two_stage, self.use_goals, self.use_vision, self.use_hist = vcfg["two_stage"], vcfg["use_goals"], vcfg["use_vision"], vcfg["use_hist"]
         layers = layers * (1 if self.two_stage else 2)
         self.text_proj, self.cam_emb = nn.Linear(D.DT, d), nn.Embedding(2, d)
-        self.vis_cnn = VisionCNN(d_out=D.DV) if VIS_MODE == 'cnn' else None
+        self.vis_cnn = VisionCNN(d_out=D.DV if VIS_MODE == 'cnn' else 256) if VIS_MODE in ('cnn', 'both') else None
+        self.cnn_proj = nn.Linear(256, d) if VIS_MODE == 'both' else None
         self.vis_proj = nn.Linear(D.DV, d)
         self.hist_proj, self.hist_pos = nn.Linear(D.TOK, d), nn.Embedding(H, d)
         self.goal_proj, self.goal_time = nn.Linear(2 * D.EXP_F, d), nn.Embedding((C + FUT) * P, d)
@@ -726,12 +732,17 @@ class HybridDenoiser(nn.Module):
         toks, pads = [self.text_proj(b["tx"])[:, None] + self.type_emb.weight[self.TXT]], [dm()[:, None]]
         if self.use_vision:
             # uint8 means raw pixels and a trained encoder; float means the frozen precomputed tokens
+            sh = CNN_SHIFT if self.training else 0
             if self.vis_cnn is not None and b["va"].dtype == torch.uint8:
-                sh = CNN_SHIFT if self.training else 0
                 fa, fw = self.vis_cnn(b["va"], sh), self.vis_cnn(b["vw"], sh)
             else:
                 fa, fw = b["va"].float(), b["vw"].float()
             v = torch.cat([self.vis_proj(fa) + self.cam_emb.weight[0], self.vis_proj(fw) + self.cam_emb.weight[1]], 1)
+            if self.vis_cnn is not None and b.get("ra") is not None:
+                # both: the trained encoder localises (object 0.445 -> 0.700) and the frozen one carries the
+                # semantics that disambiguate which object (spatial 0.845 -> 0.755 when it is removed)
+                ca, cw = self.vis_cnn(b["ra"], sh), self.vis_cnn(b["rw"], sh)
+                v = torch.cat([v, self.cnn_proj(ca) + self.cam_emb.weight[0], self.cnn_proj(cw) + self.cam_emb.weight[1]], 1)
             toks.append(v + self.type_emb.weight[self.VIS]); pads.append(dm()[:, None].expand(-1, v.shape[1]))
         if self.use_hist:
             toks.append(self.hist_proj(b["hist"]) + self.hist_pos.weight[None] + self.type_emb.weight[self.HIS]); pads.append(b["hist_pad"])
