@@ -54,6 +54,10 @@ CNN_W = int(os.environ.get("CNN_W", 64))       # base width of the trained encod
 CNN_KP = int(os.environ.get("CNN_KP", 32))     # spatial-softmax keypoints
 CNN_SHIFT = int(os.environ.get("CNN_SHIFT", 8))  # random shift augmentation, px (0 at eval)
 N_OBS = int(os.environ.get("N_OBS", 1))          # observation frames per replan (2 lets the model SEE change)
+LONG_W = float(os.environ.get("LONG_W", 1.0))    # oversampling weight for libero_10 episodes (MINERVA uses 3x)
+NOOP_TRIM = float(os.environ.get("NOOP_TRIM", 0.0))  # >0: drop leading/trailing frames whose joint motion is
+                                                     # under this rad/frame -- OpenVLA calls no-op filtering crucial
+EXCLUDE_FAILED = os.environ.get("EXCLUDE_FAILED", "")  # json from replay_demos.py: demos the actuation path cannot reproduce
 OBS_DT = int(os.environ.get("OBS_DT", 40))       # how far back the second frame is taken, in frames (2 s)
 HELDOUT_PER_TASK = 5
 
@@ -475,11 +479,35 @@ def load_data(vision=True):
     D.ep_start, D.ep_len, D.ep_task = pr["episode_start"], pr["episode_len"], pr["episode_task"]
     D.p_start, D.p_len, D.val_mask = pidx["patch_start"], pidx["patch_len"], pidx["val_mask"].astype(bool); D.E = len(D.ep_len)
     D.train_eps, D.val_eps = np.where(~D.val_mask)[0], np.where(D.val_mask)[0]
+    # --- data curation, all opt-in -------------------------------------------------------------------
+    if EXCLUDE_FAILED and Path(EXCLUDE_FAILED).exists():
+        bad = json.load(open(EXCLUDE_FAILED)); drop = set()
+        for r in bad.get("rows", []):
+            eps_t = np.where(D.ep_task == r["task"])[0]
+            for k in r.get("failed_demos", []):
+                if k < len(eps_t): drop.add(int(eps_t[k]))
+        keep = np.array([e for e in D.train_eps if e not in drop])
+        log(f"excluding {len(D.train_eps) - len(keep)} demos the actuation path cannot reproduce")
+        D.train_eps = keep
+    D.ep_w = np.ones(D.E, np.float64)
+    if LONG_W != 1.0:
+        long_tasks = {i for i, t in enumerate(D.meta["tasks"]) if t["suite"] == "libero_10"}
+        D.ep_w[np.isin(D.ep_task, list(long_tasks))] = LONG_W
+        log(f"oversampling libero_10 episodes {LONG_W}x")
     D.tr_frames = np.concatenate([np.arange(D.ep_start[e], D.ep_start[e] + D.ep_len[e]) for e in D.train_eps])
     D.pos_m, D.pos_s = pr["ee_pos"][D.tr_frames].mean(0), pr["ee_pos"][D.tr_frames].std(0) + 1e-6
     D.gr_m, D.gr_s = pr["gripper"][D.tr_frames].mean(0), pr["gripper"][D.tr_frames].std(0) + 1e-6
     exp_frame = np.concatenate([(pr["ee_pos"] - D.pos_m) / D.pos_s, pr["ee_rot6d"], (pr["gripper"] - D.gr_m) / D.gr_s], 1).astype(np.float32)
     body_frame = ((np.concatenate([pr["joint_pos"], pr["joint_vel"]], 1) - ck["mean"]) / ck["std"]).astype(np.float32)
+    D.w_lo = np.zeros(D.E, np.int64); D.w_hi = D.p_len.astype(np.int64)
+    if NOOP_TRIM > 0:
+        dq = np.abs(np.diff(pr["joint_pos"], axis=0)).sum(1)
+        for e in range(D.E):
+            a, n = int(D.ep_start[e]), int(D.ep_len[e])
+            act = np.where(dq[a:a + n - 1] > NOOP_TRIM)[0]
+            if len(act) > P * (C + 1):
+                D.w_lo[e] = max(0, act[0] // P); D.w_hi[e] = min(D.p_len[e], act[-1] // P + 2)
+        log(f"no-op trim at {NOOP_TRIM}: dropping {100 * (1 - ((D.w_hi - D.w_lo).sum() / D.p_len.sum())):.1f}% of window starts")
     D.pf_len = D.p_len * P; D.pf_start = np.concatenate([[0], np.cumsum(D.pf_len)[:-1]])
     orig_idx = np.concatenate([D.ep_start[e] + np.minimum(np.arange(D.pf_len[e]), D.ep_len[e] - 1) for e in range(D.E)])
     D.exp_pad, D.body_pad, D.orig_idx_t = torch.from_numpy(exp_frame[orig_idx]).to(DEVICE), torch.from_numpy(body_frame[orig_idx]).to(DEVICE), torch.from_numpy(orig_idx).to(DEVICE)
@@ -509,6 +537,7 @@ def load_data(vision=True):
         D.DV = int(os.environ.get("CNN_DOUT", 256)) if VIS_MODE == "cnn" else D.meta["vision_dim"]
     D.text = torch.from_numpy(np.load(DATA / "text_emb.npy")).to(DEVICE); D.DT = D.text.shape[1]
     D.pos_m_t, D.pos_s_t, D.gr_m_t, D.gr_s_t = [torch.tensor(a, device=DEVICE) for a in (D.pos_m, D.pos_s, D.gr_m, D.gr_s)]
+    D.w_lo_t, D.w_hi_t = torch.from_numpy(D.w_lo).to(DEVICE), torch.from_numpy(D.w_hi).to(DEVICE)
     D.p_start_t, D.p_len_t, D.pf_start_t, D.pf_len_t, D.ep_start_t, D.ep_len_t, D.ep_task_t = [torch.from_numpy(a).to(DEVICE) for a in (D.p_start, D.p_len, D.pf_start, D.pf_len, D.ep_start, D.ep_len, D.ep_task)]
     D.pr = pr
     # the explicit stream is the EE in the ROBOT BASE frame (01 defines it that way: the world offset is
@@ -591,8 +620,21 @@ def project_body(D, body_n, E_n, steps=PROJECT_BODY_STEPS, lam=PROJECT_BODY_LAM)
 
 # ============================================================================ batches
 def make_batch(D, eps, B, win_starts=None, hist_len=None, goals="random", perturb=False):
-    e = torch.as_tensor(np.random.choice(eps, B) if win_starts is None else eps, device=DEVICE); Np = D.p_len_t[e]
-    w = torch.as_tensor(win_starts, device=DEVICE) if win_starts is not None else (torch.rand(B, device=DEVICE) * (Np - C + 1)).long()
+    if win_starts is None:
+        pw = getattr(D, "ep_w", None)
+        if pw is not None and not np.allclose(pw[eps], 1.0):
+            q = pw[eps] / pw[eps].sum(); pick = np.random.choice(eps, B, p=q)
+        else: pick = np.random.choice(eps, B)
+        e = torch.as_tensor(pick, device=DEVICE)
+    else:
+        e = torch.as_tensor(eps, device=DEVICE)
+    Np = D.p_len_t[e]
+    if win_starts is not None:
+        w = torch.as_tensor(win_starts, device=DEVICE)
+    else:
+        lo = D.w_lo_t[e]; hi = torch.minimum(D.w_hi_t[e], Np)
+        span = torch.clamp(hi - lo - C + 1, min=1)
+        w = lo + (torch.rand(B, device=DEVICE) * span).long()
     hmax = torch.minimum(torch.full_like(w, H), w); h = hmax if hist_len == "max" else (torch.rand(B, device=DEVICE) * (hmax + 1)).long()
     ps = D.p_start_t[e]; x0 = D.hyb[(ps + w)[:, None] + torch.arange(C, device=DEVICE)]
     j = torch.arange(H, device=DEVICE)[None]; hist_pad = j < (H - h)[:, None]; hist = D.hyb[((ps + w)[:, None] - (H - j)).clamp(min=0)] * (~hist_pad)[..., None]
