@@ -138,7 +138,8 @@ for step in range(1, A.STEPS + 1):
     l_con = F.mse_loss(fk_pos_n, Ef[..., :3]) + F.mse_loss(fk_r6, Ef[..., 3:9])
     gm = b["g_win"].reshape(B, C * P, D.EXP_F)
     l_goal_body = (((fk_pos_n - Eg[..., :3]) ** 2 * gm[..., :3]).sum() + ((fk_r6 - Eg[..., 3:9]) ** 2 * gm[..., 3:9]).sum()) / gm[..., :9].sum().clamp(min=1.0)
-    loss = l_hyb + A.W_GOAL * (l_goal + l_goal_body) + A.W_BODY * l_body + A.W_CONSIST * l_con + A.W_GRIP * l_grip
+    l_dct = A.dct_loss(E_hat, E_) if A.W_DCT > 0 else torch.zeros((), device=DEVICE)
+    loss = l_hyb + A.W_GOAL * (l_goal + l_goal_body) + A.W_BODY * l_body + A.W_CONSIST * l_con + A.W_GRIP * l_grip + A.W_DCT * l_dct
     opt.zero_grad(set_to_none=True); scaler.scale(loss).backward(); scaler.unscale_(opt); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); scaler.step(opt); scaler.update(); sched.step()
     ema_update(step)
     if A.VAL_EVERY and step % A.VAL_EVERY == 0:

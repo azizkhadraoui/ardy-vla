@@ -57,6 +57,12 @@ N_OBS = int(os.environ.get("N_OBS", 1))          # observation frames per replan
 LONG_W = float(os.environ.get("LONG_W", 1.0))    # oversampling weight for libero_10 episodes (MINERVA uses 3x)
 MEM_K = int(os.environ.get("MEM_K", 0))          # >0: recurrent visual memory over MEM_K past frames
 MEM_DT = int(os.environ.get("MEM_DT", 40))       # spacing between them, frames (MEM_K x MEM_DT = horizon covered)
+CAM_MASK = os.environ.get("CAM_MASK", "")        # "wrist" | "agentview": blind that camera (zeros in), train and test
+W_DCT = float(os.environ.get("W_DCT", 0.0))      # >0: frequency-WEIGHTED DCT loss on the explicit trajectory. With
+                                                 # uniform weights this equals the plain MSE (Parseval), so it is
+                                                 # only meaningful with the low-pass weighting below
+DCT_TAU = float(os.environ.get("DCT_TAU", 4.0))  # weight exp(-f/tau) over the C*P frequencies: a smoothness prior
+CNN_QUERIES = int(os.environ.get("CNN_QUERIES", 0))  # >0: K learnable queries cross-attend the 16x16 map (resampler)
 NOOP_TRIM = float(os.environ.get("NOOP_TRIM", 0.0))  # >0: drop leading/trailing frames whose joint motion is
                                                      # under this rad/frame -- OpenVLA calls no-op filtering crucial
 EXCLUDE_FAILED = os.environ.get("EXCLUDE_FAILED", "")  # json from replay_demos.py: demos the actuation path cannot reproduce
@@ -70,7 +76,8 @@ TOK_STEPS = int(os.environ.get("TOK_STEPS", 12000))
 TOK_W_VEL, TOK_VEL_DIM_W, TOK_NOISE, TOK_DROPOUT = 1.0, 0.3, 0.02, 0.1
 
 # denoiser
-C, H, FUT, MAX_GOALS = 4, 32, 12, 3
+C = int(os.environ.get("CHUNK", 4))       # patches per window: 4 = 16 frames = 0.8 s. Literature optimum ~16-24 frames
+H, FUT, MAX_GOALS = 32, 12, 3
 T_DIFF, SAMPLE_STEPS, N_HEADS = 100, int(os.environ.get("SAMPLE_STEPS", 10)), 8
 PRESET = os.environ.get("PRESET", "long")
 _p = dict(long=dict(D_MODEL=384, LAYERS=6, STEPS=30000), quick=dict(D_MODEL=256, LAYERS=4, STEPS=8000), scale=dict(D_MODEL=512, LAYERS=8, STEPS=60000))[PRESET]
@@ -655,6 +662,8 @@ def make_batch(D, eps, B, win_starts=None, hist_len=None, goals="random", pertur
         va = torch.zeros(B, 1 + POOL * POOL, D.DV, device=DEVICE, dtype=torch.float16); vw = torch.zeros_like(va)
     else:
         va = D.vis_a[f0c].to(DEVICE, non_blocking=True); vw = D.vis_w[f0c].to(DEVICE, non_blocking=True)
+        if CAM_MASK == "wrist": vw = torch.zeros_like(vw)
+        if CAM_MASK == "agentview": va = torch.zeros_like(va)
     vmem = None
     if MEM_K > 0 and D.vis_a is not None and D.vis_a.dtype != torch.uint8:
         # oldest -> newest, clamped to the episode start so early windows repeat the first frame
@@ -760,6 +769,13 @@ class VisionCNN(nn.Module):
         self.n_kp, self.d_out = n_kp, d_out
         self.kp_proj = nn.Linear(3 * n_kp, d_out)              # (x, y, presence) per keypoint
         self.map_proj = nn.Linear(2 * w, d_out)                # plus a coarse 4x4 grid of pooled features
+        if CNN_QUERIES > 0:
+            # a perceiver-style latent buffer: K learnable queries read the FULL 16x16 map by cross-attention,
+            # instead of the fixed 4x4 mean-pool. The readout is learned, not prescribed.
+            self.queries = nn.Parameter(torch.randn(CNN_QUERIES, d_out) * 0.02)
+            self.pos2d = nn.Parameter(torch.randn(256, d_out) * 0.02)
+            self.xattn = nn.MultiheadAttention(d_out, 4, batch_first=True)
+            self.q_norm, self.kv_norm = nn.LayerNorm(d_out), nn.LayerNorm(d_out)
 
     def forward(self, u8, shift=0):
         """u8 (B,H,W,3) uint8 -> (B, 17, d_out): one keypoint token + a 4x4 grid, matching the token budget
@@ -780,6 +796,11 @@ class VisionCNN(nn.Module):
         px, py = (a * gx).sum(-1), (a * gy).sum(-1)            # expected position of each keypoint
         pres = k.reshape(B, K, -1).max(-1).values               # how strongly it fired at all
         kp = self.kp_proj(torch.cat([px, py, pres], -1))[:, None]          # (B, 1, d_out)
+        if CNN_QUERIES > 0:
+            kv = self.kv_norm(self.map_proj(h.flatten(2).transpose(1, 2)) + self.pos2d[None, :H * W])   # (B, 256, d)
+            q = self.q_norm(self.queries)[None].expand(B, -1, -1)
+            out, _ = self.xattn(q, kv, kv)
+            return torch.cat([kp, out], 1)                                   # (B, 1+K, d_out)
         g = F.adaptive_avg_pool2d(h, POOL).flatten(2).transpose(1, 2)      # (B, POOL^2, 2w)
         return torch.cat([kp, self.map_proj(g)], 1)
 
@@ -893,6 +914,22 @@ def load_model(D, variant, seed):
 
 # ============================================================================ diffusion / sampling
 _tt = torch.arange(T_DIFF + 1, device=DEVICE) / T_DIFF; _ab = torch.cos((_tt + 0.008) / 1.008 * math.pi / 2) ** 2; AB = (_ab / _ab[0])[1:].clamp(1e-5, 0.9999)
+
+
+def dct_matrix(n, device):
+    """Orthonormal DCT-II. Because it is orthonormal, an unweighted MSE in this basis equals the time-domain MSE
+    exactly (Parseval); the loss below is only different because it weights the frequencies."""
+    k = torch.arange(n, device=device, dtype=torch.float32)[:, None]; i = torch.arange(n, device=device, dtype=torch.float32)[None]
+    M = torch.cos(math.pi * (i + 0.5) * k / n) * math.sqrt(2.0 / n); M[0] /= math.sqrt(2.0); return M
+
+
+def dct_loss(E_hat, E, tau=DCT_TAU):
+    """Frequency-weighted MSE on the explicit trajectory: (B, C, EXP) -> per-frame (B, C*P, EXP_F) -> DCT over time."""
+    B = E.shape[0]; T = C * P; F_ = E.shape[-1] // P
+    a, b = E_hat.reshape(B, T, F_), E.reshape(B, T, F_)
+    M = dct_matrix(T, E.device)                                     # (T, T)
+    w = torch.exp(-torch.arange(T, device=E.device, dtype=torch.float32) / tau)[None, :, None]
+    return (((torch.einsum("kt,btf->bkf", M, a) - torch.einsum("kt,btf->bkf", M, b)) ** 2) * w).mean()
 
 
 def q_sample(x0, t, noise): return AB[t].sqrt()[:, None, None] * x0 + (1 - AB[t]).sqrt()[:, None, None] * noise
@@ -1201,6 +1238,8 @@ class Policy:
         D = self.D; hist, pad = self._history_tokens()
         raw = lambda k: torch.from_numpy(np.ascontiguousarray(self.obs[k]))[None].to(DEVICE)
         va2 = vw2 = None
+        if CAM_MASK == "wrist": self.obs = dict(self.obs); self.obs["robot0_eye_in_hand_image"] = np.zeros_like(self.obs["robot0_eye_in_hand_image"])
+        if CAM_MASK == "agentview": self.obs = dict(self.obs); self.obs["agentview_image"] = np.zeros_like(self.obs["agentview_image"])
         ra = rw = None
         if VIS_MODE == "both":
             # both token sets: the frozen encoder for semantics, the trained one for localisation. Sending
