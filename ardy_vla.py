@@ -57,6 +57,9 @@ N_OBS = int(os.environ.get("N_OBS", 1))          # observation frames per replan
 LONG_W = float(os.environ.get("LONG_W", 1.0))    # oversampling weight for libero_10 episodes (MINERVA uses 3x)
 MEM_K = int(os.environ.get("MEM_K", 0))          # >0: recurrent visual memory over MEM_K past frames
 MEM_DT = int(os.environ.get("MEM_DT", 40))       # spacing between them, frames (MEM_K x MEM_DT = horizon covered)
+MEM_WM = int(os.environ.get("MEM_WM", 0))        # 1: the memory token is an action-conditioned forward model over the H history patches
+WM_CKPT = os.environ.get("WM_CKPT", "")          # pretrained forward model (world_model.py) to initialise it from
+WM_FREEZE = int(os.environ.get("WM_FREEZE", 0))  # 1: keep its recurrent core frozen during policy training
 CAM_MASK = os.environ.get("CAM_MASK", "")        # "wrist" | "agentview": blind that camera (zeros in), train and test
 W_DCT = float(os.environ.get("W_DCT", 0.0))      # >0: frequency-WEIGHTED DCT loss on the explicit trajectory. With
                                                  # uniform weights this equals the plain MSE (Parseval), so it is
@@ -628,6 +631,21 @@ def project_body(D, body_n, E_n, steps=PROJECT_BODY_STEPS, lam=PROJECT_BODY_LAM)
 
 
 # ============================================================================ batches
+def wm_gather(D, e, w):
+    """Scene features for the world-model memory: (B, H+1, 2*DV), one mean-pooled vector per camera at the
+    frame BEFORE each of the H history patches and at the current frame, oldest -> current.
+
+    Aligned so that history token i (frames base-(H-i)P .. base-(H-i-1)P) sits between z[i] and z[i+1]: the
+    explicit stream of that token is the action whose consequence the forward model must predict. Frames
+    before the episode start are clamped to its first frame (the history tokens there are padding anyway)."""
+    B = e.shape[0]; base = D.pf_start_t[e] + w * P - VIS_FRAME_OFFSET
+    offs = torch.arange(H, -1, -1, device=DEVICE) * P
+    idx = D.orig_idx_t[torch.clamp(base[:, None] - offs[None], min=0)]
+    idx = torch.maximum(idx, torch.as_tensor(D.ep_start, device=DEVICE)[e][:, None]).cpu().reshape(-1)
+    za = D.vis_a[idx].to(DEVICE, non_blocking=True).float().mean(1); zw = D.vis_w[idx].to(DEVICE, non_blocking=True).float().mean(1)
+    return torch.cat([za, zw], -1).reshape(B, H + 1, -1)
+
+
 def make_batch(D, eps, B, win_starts=None, hist_len=None, goals="random", perturb=False):
     if win_starts is None:
         pw = getattr(D, "ep_w", None)
@@ -665,7 +683,9 @@ def make_batch(D, eps, B, win_starts=None, hist_len=None, goals="random", pertur
         if CAM_MASK == "wrist": vw = torch.zeros_like(vw)
         if CAM_MASK == "agentview": va = torch.zeros_like(va)
     vmem = None
-    if MEM_K > 0 and D.vis_a is not None and D.vis_a.dtype != torch.uint8:
+    if MEM_WM and D.vis_a is not None and D.vis_a.dtype != torch.uint8:
+        vmem = wm_gather(D, e, w)
+    elif MEM_K > 0 and D.vis_a is not None and D.vis_a.dtype != torch.uint8:
         # oldest -> newest, clamped to the episode start so early windows repeat the first frame
         base = D.pf_start_t[e] + w * P
         offs = torch.arange(MEM_K - 1, -1, -1, device=DEVICE) * MEM_DT
@@ -748,6 +768,55 @@ class VisionMemory(nn.Module):
         return self.norm(out[:, -1:])          # (B, 1, d): the state after seeing the whole window
 
 
+class WorldMemory(nn.Module):
+    """The memory token as a latent forward model: its recurrent state after reading (scene, action) pairs.
+
+    VisionMemory summarises what the cameras showed; nothing ties that to what the arm DID, and nowhere in the
+    pipeline is the model asked what its actions do to the scene. This module reads the history as pairs
+    (z_i, a_i) at patch stride -- z the mean-pooled frozen features of both cameras, a the explicit EE stream
+    the history token carries -- and is first trained (world_model.py) to predict z_{i+1} - z_i, the physical
+    consequence of the action in feature space, so its state has to encode what has moved and how. The policy
+    then fine-tunes it in place of VisionMemory. The feature normalisation lives in buffers, so a policy
+    checkpoint is self-contained and the pretraining statistics travel with the weights."""
+    def __init__(self, dz, da, d, layers=1):
+        super().__init__()
+        self.inp = nn.Linear(dz + da, d); self.gru = nn.GRU(d, d, num_layers=layers, batch_first=True)
+        self.norm = nn.LayerNorm(d); self.head = nn.Linear(d, dz)
+        self.register_buffer("z_mean", torch.zeros(dz)); self.register_buffer("z_std", torch.ones(dz))
+
+    def znorm(self, z): return (z - self.z_mean) / self.z_std
+
+    def run(self, z, a, pad, h0=None):
+        """z (B,K+1,dz) raw, oldest -> current; a (B,K,da) the explicit stream executed between consecutive z;
+        pad (B,K) True where the history token is absent (its input is zeroed, as the token itself is)."""
+        x = self.inp(torch.cat([self.znorm(z[:, :-1]), a], -1)) * (~pad)[..., None].float()
+        return self.gru(x, h0)
+
+    def forward(self, z, a, pad):
+        out, _ = self.run(z, a, pad); return self.norm(out[:, -1:])          # (B,1,d): the state after the last action
+
+    def predict(self, z, a, pad):
+        """Teacher-forced one-step predictions of the NORMALISED next feature, (B,K,dz)."""
+        out, _ = self.run(z, a, pad); return self.znorm(z[:, :-1]) + self.head(out)
+
+    def rollout(self, z0, a, h0=None):
+        """Open loop from raw z0 (B,dz) through actions (B,R,da), feeding each prediction back. Normalised z_1..z_R."""
+        zn = self.znorm(z0); outs = []
+        for r in range(a.shape[1]):
+            o, h0 = self.gru(self.inp(torch.cat([zn, a[:, r]], -1))[:, None], h0); zn = zn + self.head(o[:, 0]); outs.append(zn)
+        return torch.stack(outs, 1), h0
+
+    def load_pretrained(self, path, freeze=False):
+        ck = torch.load(path, map_location="cpu", weights_only=False)
+        missing, unexpected = self.load_state_dict(ck["state_dict"], strict=False)
+        bad = [m for m in missing if not m.startswith("norm.")]
+        if bad or unexpected: raise RuntimeError(f"world model {path} does not fit: missing {bad}, unexpected {unexpected}")
+        if freeze:
+            for p_ in list(self.inp.parameters()) + list(self.gru.parameters()): p_.requires_grad_(False)
+        log(f"world model {Path(path).name}: {ck.get('step')} steps, 1-step R2 {ck.get('val', {}).get('r2_1step', float('nan')):.3f}"
+            f"{' (core frozen)' if freeze else ''}")
+
+
 class VisionCNN(nn.Module):
     """From-scratch encoder over a 128px frame: depthwise-separable stack -> spatial softmax keypoints.
 
@@ -823,7 +892,7 @@ class HybridDenoiser(nn.Module):
         self.vis_cnn = VisionCNN(d_out=D.DV if VIS_MODE == 'cnn' else 256) if VIS_MODE in ('cnn', 'both') else None
         self.cnn_proj = nn.Linear(256, d) if VIS_MODE == 'both' else None
         self.obs_emb = nn.Embedding(2, d) if N_OBS > 1 else None     # now vs earlier
-        self.vis_mem = VisionMemory(D.DV, d) if MEM_K > 0 else None
+        self.vis_mem = WorldMemory(2 * D.DV, D.EXP, d) if MEM_WM else (VisionMemory(D.DV, d) if MEM_K > 0 else None)
         self.vis_proj = nn.Linear(D.DV, d)
         self.hist_proj, self.hist_pos = nn.Linear(D.TOK, d), nn.Embedding(H, d)
         self.goal_proj, self.goal_time = nn.Linear(2 * D.EXP_F, d), nn.Embedding((C + FUT) * P, d)
@@ -859,7 +928,11 @@ class HybridDenoiser(nn.Module):
                 v = torch.cat([v, self.cnn_proj(ca) + self.cam_emb.weight[0], self.cnn_proj(cw) + self.cam_emb.weight[1]], 1)
             toks.append(v + self.type_emb.weight[self.VIS]); pads.append(dm()[:, None].expand(-1, v.shape[1]))
         if self.vis_mem is not None and b.get("vmem") is not None:
-            toks.append(self.vis_mem(b["vmem"].float()) + self.type_emb.weight[self.MEM]); pads.append(dm()[:, None])
+            if isinstance(self.vis_mem, WorldMemory):
+                m = self.vis_mem(b["vmem"].float(), b["hist"][..., :self.EXP], b["hist_pad"])   # the history's explicit stream IS the action sequence
+            else:
+                m = self.vis_mem(b["vmem"].float())
+            toks.append(m + self.type_emb.weight[self.MEM]); pads.append(dm()[:, None])
         if self.use_hist:
             toks.append(self.hist_proj(b["hist"]) + self.hist_pos.weight[None] + self.type_emb.weight[self.HIS]); pads.append(b["hist_pad"])
         if self.use_goals:   # goal tokens are always the LAST MAX_GOALS conditioning tokens (CFG relies on this)
@@ -1045,6 +1118,19 @@ def evaluate_openloop(D, model, vcfg, eps, horizons=HORIZONS, windows=VAL_WINDOW
 
 
 # ============================================================================ closed-loop LIBERO runner
+_T5 = {}
+
+
+def embed_text(strings):
+    """Mean-pooled T5 vectors for arbitrary instructions, the same recipe 01_prepare_data.py used for text_emb.npy."""
+    if not _T5:
+        from transformers import AutoTokenizer, T5EncoderModel
+        _T5["tk"] = AutoTokenizer.from_pretrained(TEXT_MODEL); _T5["m"] = T5EncoderModel.from_pretrained(TEXT_MODEL).to(DEVICE).eval()
+    with torch.no_grad():
+        enc = _T5["tk"](list(strings), return_tensors="pt", padding=True).to(DEVICE); hs = _T5["m"](**enc).last_hidden_state
+        m = enc.attention_mask[..., None].float(); return ((hs * m).sum(1) / m.sum(1)).float()
+
+
 class OnlineEncoder:
     """Frozen vision encoder + text embeddings, identical to 01_prepare_data.py, for online use."""
     def __init__(self, meta):
@@ -1103,11 +1189,15 @@ class LiberoTask:
         self.env.reset()
         try: self.env.set_init_state(self.init_states[init_idx])
         except Exception as ex: log(f"set_init_state failed ({ex}); using env.reset() placement")
+        self._post_set_state()
         robot = self.env.env.robots[0]; ctrl = robot.controller
         ctrl.output_max = np.full(7, 0.15); ctrl.output_min = np.full(7, -0.15); ctrl.action_scale = None; ctrl.kp = np.full(7, float(os.environ.get("JP_KP", 150)))
         ctrl.kd = 2 * np.sqrt(ctrl.kp) * ctrl.damping_ratio if hasattr(ctrl, "damping_ratio") else ctrl.kd
         for _ in range(5): obs, *_ = self.env.step(np.zeros(8))
         self.robot = robot; return obs
+
+    def _post_set_state(self):
+        """Hook run after the saved init state is loaded, before the arm settles. A no-op here; PlusTask uses it."""
 
     def step_to(self, q_target, grip_closed):
         """One env step towards joint targets (rad) with a delta joint-position command; gripper +1 closes, -1 opens."""
@@ -1126,6 +1216,38 @@ class LiberoTask:
             demos = sorted(f["data"].keys(), key=lambda s: int(s.split("_")[1])); return f["data"][demos[k]]["states"][()]
 
     def close(self): self.env.close()
+
+
+class PlusTask(LiberoTask):
+    """One LIBERO-plus variant of original task `task_index`: a single init state, possibly a rewritten instruction.
+
+    LIBERO_DIR must point at the LIBERO-plus checkout. It registers the same suite names with ~2,500 perturbed
+    variants each; camera / noise perturbations are parsed by ITS env from the task name, everything else has
+    its own BDDL. Nothing in the policy changes, which is the point: this is the generalisation test."""
+    def __init__(self, D, task_index, bench, plus_id, camera_res=128, record_cams=()):
+        os.environ.setdefault("MUJOCO_GL", "egl"); ensure_libero_repo(); patch_robosuite()
+        from libero.libero import get_libero_path
+        from libero.libero.envs import OffScreenRenderEnv
+        self.D, self.info = D, D.meta["tasks"][task_index]; self.task_index = task_index
+        self.task, self.task_id = bench.get_task(plus_id), plus_id; self.init_states = np.asarray(bench.get_task_init_states(plus_id))
+        self.env = OffScreenRenderEnv(bddl_file_name=os.path.join(get_libero_path("bddl_files"), self.task.problem_folder, self.task.bddl_file),
+                                      camera_heights=camera_res, camera_widths=camera_res, controller="JOINT_POSITION")
+        self.env.seed(0); self.record_cams = list(record_cams); self.res = camera_res
+        self.episodes = np.where(D.ep_task == task_index)[0]; self.h5 = None
+
+    def _post_set_state(self):
+        """Put the arm back at ITS init_qpos after the saved state is loaded.
+
+        The "Robot Initial States" perturbation is a robot class (MountedPanda{N}) whose sole difference is
+        init_qpos. get_task_init_states hands those variants the ORIGINAL task's saved sim state, and that state
+        contains the original robot joints -- so loading it would silently undo the perturbation and the category
+        would measure nothing. Re-applying the model's own init_qpos keeps the object layout from the saved state
+        and the arm where the variant wants it. For every other variant the robot is the unperturbed MountedPanda,
+        whose init_qpos is exactly what the saved state already holds, so this changes nothing."""
+        robot = self.env.env.robots[0]; sim = self.env.env.sim
+        sim.data.qpos[robot._ref_joint_pos_indexes] = np.asarray(robot.init_qpos, np.float64)
+        sim.data.qvel[robot._ref_joint_vel_indexes] = 0.0
+        sim.forward()
 
 
 class Policy:
@@ -1251,12 +1373,18 @@ class Policy:
             va, vw = raw("agentview_image"), raw("robot0_eye_in_hand_image")
         else:
             va = self.enc(self.obs["agentview_image"]); vw = self.enc(self.obs["robot0_eye_in_hand_image"])
-        if N_OBS > 1 or MEM_K > 0:
+        if N_OBS > 1 or MEM_K > 0 or MEM_WM:
             self.obs_buf.append((va, vw))
             k = max(0, len(self.obs_buf) - 1 - OBS_DT // max(1, self.exec))
             va2, vw2 = self.obs_buf[k]
         vmem = None
-        if MEM_K > 0 and va.dtype != torch.uint8:
+        if MEM_WM and va.dtype != torch.uint8:
+            # z before each of the H history patches plus the current frame: the observation taken j patches
+            # ago is j*P/exec replans back, clamped to the first observation where the history is padding
+            step = max(1, P // max(1, self.exec))
+            picks = [max(0, len(self.obs_buf) - 1 - j * step) for j in range(H, -1, -1)]
+            vmem = torch.stack([torch.cat([self.obs_buf[i][0].float().mean(1)[0], self.obs_buf[i][1].float().mean(1)[0]]) for i in picks])[None]
+        elif MEM_K > 0 and va.dtype != torch.uint8:
             step = max(1, MEM_DT // max(1, self.exec))
             picks = [max(0, len(self.obs_buf) - 1 - j * step) for j in range(MEM_K - 1, -1, -1)]
             vmem = torch.stack([self.obs_buf[i][0].float().mean(1)[0] for i in picks])[None]

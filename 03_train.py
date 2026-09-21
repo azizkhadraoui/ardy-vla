@@ -33,7 +33,8 @@ if dst.exists() and os.environ.get("FORCE", "0") != "1":
     log(f"{dst.name} exists; set FORCE=1 to retrain"); sys.exit(0)
 A.seed_all(SEED); D = A.load_data()
 model = A.HybridDenoiser(D, vcfg).to(DEVICE); n_par = sum(p.numel() for p in model.parameters()) / 1e6
-opt = torch.optim.AdamW(model.parameters(), lr=A.LR, betas=(0.9, 0.99), weight_decay=0.01)
+if A.MEM_WM and A.WM_CKPT: model.vis_mem.load_pretrained(A.WM_CKPT, freeze=bool(A.WM_FREEZE))
+opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=A.LR, betas=(0.9, 0.99), weight_decay=0.01)
 sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, s / 500) * 0.5 * (1 + math.cos(math.pi * min(s, A.STEPS) / A.STEPS)))
 scaler = torch.amp.GradScaler("cuda", enabled=A.USE_AMP)
 log(f"=== {VARIANT} seed {SEED}: {n_par:.2f}M params, d={A.D_MODEL} layers={A.LAYERS} steps={A.STEPS} batch={A.BATCH}  {vcfg}")
@@ -80,7 +81,7 @@ def save_ckpt(step, final=False):
     torch.save(dict(state_dict=save_sd, state_dict_raw=(raw_sd if ema is not None else None), ema=A.EMA_DECAY,
                     variant=vcfg, name=VARIANT, seed=SEED, d_model=A.D_MODEL, layers=A.LAYERS, step=step,
                     history=hist, val_history=val_hist, preset=A.PRESET, w_grip=A.W_GRIP,
-                    secs=round(time.time() - t0), final=final, vis_mode=A.VIS_MODE, cnn_dout=D.DV), tmp)
+                    secs=round(time.time() - t0), final=final, vis_mode=A.VIS_MODE, cnn_dout=D.DV, mem_wm=A.MEM_WM, wm_ckpt=A.WM_CKPT), tmp)
     os.replace(tmp, dst)
 
 
