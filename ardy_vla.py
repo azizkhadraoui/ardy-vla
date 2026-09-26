@@ -1360,8 +1360,6 @@ class Policy:
         D = self.D; hist, pad = self._history_tokens()
         raw = lambda k: torch.from_numpy(np.ascontiguousarray(self.obs[k]))[None].to(DEVICE)
         va2 = vw2 = None
-        if CAM_MASK == "wrist": self.obs = dict(self.obs); self.obs["robot0_eye_in_hand_image"] = np.zeros_like(self.obs["robot0_eye_in_hand_image"])
-        if CAM_MASK == "agentview": self.obs = dict(self.obs); self.obs["agentview_image"] = np.zeros_like(self.obs["agentview_image"])
         ra = rw = None
         if VIS_MODE == "both":
             # both token sets: the frozen encoder for semantics, the trained one for localisation. Sending
@@ -1373,6 +1371,12 @@ class Policy:
             va, vw = raw("agentview_image"), raw("robot0_eye_in_hand_image")
         else:
             va = self.enc(self.obs["agentview_image"]); vw = self.enc(self.obs["robot0_eye_in_hand_image"])
+        # Mask the TOKENS, not the image. make_batch zeroes the feature tensor, so blanking the pixels here and
+        # encoding them would hand the model DINOv2-of-black -- a constant it never saw in training, which is a
+        # different question from "this camera is absent". That mismatch is what produced 0.000 on every one of
+        # 700 wrist-masked episodes. In cnn/both mode va IS the pixel tensor, so the same line still matches.
+        if CAM_MASK == "wrist": vw = torch.zeros_like(vw)
+        if CAM_MASK == "agentview": va = torch.zeros_like(va)
         if N_OBS > 1 or MEM_K > 0 or MEM_WM:
             self.obs_buf.append((va, vw))
             k = max(0, len(self.obs_buf) - 1 - OBS_DT // max(1, self.exec))
