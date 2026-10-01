@@ -47,9 +47,18 @@ TAG = os.environ.get("TAG", "")
 dst = A.RES_DIR / f"closedloop_{VARIANT}_s{SEED}{'_proj' if PROJECT else ''}{TAG}.json"
 if dst.exists() and os.environ.get("FORCE", "0") != "1": log(f"{dst.name} exists; skipping"); sys.exit(0)
 
+if A.VIS_SUFFIX == "_ft" and not A.VIS_CKPT:
+    raise SystemExit("VIS_SUFFIX=_ft needs VIS_CKPT=<vis_ft checkpoint>: the policy was trained on adapted "
+                     "features and re-encoding with the pretrained weights scores ~0.08")
 D = A.load_data(vision=False)
 ck = torch.load(A.CKPT_DIR / f"{VARIANT}_s{SEED}.pt", map_location=DEVICE, weights_only=False)
-model = A.HybridDenoiser(D, ck["variant"], d=ck.get("d_model", A.D_MODEL), layers=ck.get("layers", A.LAYERS), w_grip=ck.get("w_grip", 0.0)).to(DEVICE); A.load_compat(model, ck["state_dict"]); model.eval()
+# the model is sized from the environment, so a checkpoint trained with a head the environment does not ask for
+# would be built wrong and silently evaluated wrong. Refuse instead.
+for _k, _env in (("w_grasp", A.W_GRASP), ("l1_head", A.L1_HEAD)):
+    if float(ck.get(_k, 0)) != float(_env):
+        raise SystemExit(f"checkpoint has {_k}={ck.get(_k, 0)} but the environment says {_env}; set it to match")
+model = A.HybridDenoiser(D, ck["variant"], d=ck.get("d_model", A.D_MODEL), layers=ck.get("layers", A.LAYERS), w_grip=ck.get("w_grip", 0.0)).to(DEVICE)
+A.load_compat(model, ck["state_dict"]); model.eval()
 enc = A.OnlineEncoder(D.meta)
 records = []; epi_dir = A.EPI_DIR / f"{VARIANT}_s{SEED}{TAG}"; epi_dir.mkdir(exist_ok=True)
 A.wandb_init("closedloop", VARIANT, SEED, config=dict(ckpt_step=ck.get("step"), n_init=N_INIT, n_init_proto=N_INIT_PROTO,
@@ -104,6 +113,7 @@ def run_condition(task, policy, init_idx, proto, record):
     if box_center is not None and ee.shape[0] > T0:
         lo, hi = max(0, f_goal - 10), min(ee.shape[0], f_goal + 10); rec["collision"] = bool((np.abs(ee[lo:hi] - box_center) < BOX).all(-1).any()); rec["box_center"] = box_center.tolist()
     if ee.shape[0] > 3: rec["accel_cm"] = float(np.linalg.norm(np.diff(ee, 2, axis=0), axis=-1).mean() * 100)
+    rec["n_plans"], rec["mean_stride"] = int(out["n_plans"]), float(out["mean_stride"])   # replans per episode: the latency number
     if record:
         # everything the model works in is the robot base frame; the videos in 08 draw into camera images,
         # so the recorded geometry is put back into world coordinates here, once, with the task's base transform
@@ -145,7 +155,7 @@ def summarise(recs):
     out = {}
     for proto in dict.fromkeys(r["protocol"] for r in recs):
         rs = [r for r in recs if r["protocol"] == proto]; s = dict(n=len(rs), success=float(np.mean([r["success"] for r in rs])))
-        for k in ("adherence_cm", "grip_err_mm", "accel_cm"):
+        for k in ("adherence_cm", "grip_err_mm", "accel_cm", "n_plans", "mean_stride"):
             v = [r[k] for r in rs if k in r]; s[k] = float(np.mean(v)) if v else None
         if any("collision" in r for r in rs): s["collision"] = float(np.mean([r["collision"] for r in rs if "collision" in r]))
         out[proto] = s
@@ -154,7 +164,10 @@ summary = dict(all=summarise(records), per_suite={s: summarise([r for r in recor
 json.dump(dict(variant=VARIANT, seed=SEED, project=PROJECT, exec_frames=EXEC, n_init=N_INIT, n_init_proto=N_INIT_PROTO,
                knobs=dict(grip_src=A.GRIP_SRC, grip_lo=A.GRIP_LO, grip_hi=A.GRIP_HI, grip_latch=A.GRIP_LATCH, grip_gate_cm=A.GRIP_GATE_CM,
                           project_mode=A.PROJECT_MODE, ensemble_k=A.ENSEMBLE_K, ensemble_m=A.ENSEMBLE_M,
-                          hist_source=A.HIST_SOURCE, seeded=A.SEED_SAMPLER, sample_steps=A.SAMPLE_STEPS),
+                          hist_source=A.HIST_SOURCE, seeded=A.SEED_SAMPLER, sample_steps=A.SAMPLE_STEPS,
+                          exec_src=A.EXEC_SRC, chunk=A.C, cam_mask=A.CAM_MASK, mem_k=A.MEM_K, vis_mode=A.VIS_MODE,
+                          exec_adapt=A.EXEC_ADAPT, adapt_free=A.ADAPT_FREE, ent_adapt=A.ENT_ADAPT, ent_n=A.ENT_N,
+                          ent_mode=A.ENT_MODE, ent_tol=A.ENT_TOL),
                records=records, summary=summary, secs=round(time.time() - t_all), partial=False), open(dst, "w"), indent=1)
 print("\n" + "=" * 100); print(f" {VARIANT} seed {SEED}{' +projection' if PROJECT else ''}   ({(time.time()-t_all)/3600:.1f} h)")
 print(f" {'condition':10s}{'n':>6s}{'success':>10s}{'adherence cm':>14s}{'grip mm':>10s}{'collision':>11s}{'accel cm':>10s}"); print("-" * 100)

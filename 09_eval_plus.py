@@ -24,7 +24,7 @@ OUTPUT  $WORK_DIR/results/plus_{variant}_s{seed}{TAG}.json: per-episode records,
     LIBERO_DIR=.../LIBERO-plus VARIANT=two_stage_goal SEED=51 MEM_K=8 LONG_W=3 PLUS_N=30 PLUS_SUITES=libero_10 python 09_eval_plus.py
     knobs: PLUS_N (variants per category per suite, 30), PLUS_SUITES, PLUS_CATS, PLUS_SEED (variant draw, 0), EXEC (4), PROJECT (1), TAG, MAXTASKS
 """
-import os, sys, json, time, re
+import os, sys, json, time, re, gc
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("MUJOCO_GL", "egl")
 import numpy as np, torch
@@ -87,15 +87,29 @@ for suite in PLUS_SUITES:
         stem = original_of(name, stems)
         if stem is None: log(f"  no original for {name}; skipped"); continue
         ti = stems[stem]; pid = by_name[name]; t0 = time.time()
+        # One bad variant must not take the suite down with it. LIBERO-plus's corruption code is not numpy-2.0
+        # clean, and a raise inside env.step() during the 150th episode otherwise discards the 149 before it.
+        task = None
         try:
             task = A.PlusTask(D, ti, bench, pid)
+            policy = A.Policy(D, model, vcfg, enc, ti, exec_frames=EXEC, project=PROJECT)
+            lang = task.task.language
+            if cat == "Language Instructions": policy.tx = A.embed_text([lang])
+            policy.seed_base = (1000003 * ti + 10007 * pid + 7 * SEED) if A.SEED_SAMPLER else None
+            out = A.run_episode(task, policy, 0, max_steps=MAX_STEPS[suite])
         except Exception as ex:
-            log(f"  {name}: env failed ({type(ex).__name__}: {str(ex)[:120]})"); records.append(dict(suite=suite, category=cat, level=level, name=name, task=ti, plus_id=pid, error=str(ex)[:300], success=False, steps=0)); continue
-        policy = A.Policy(D, model, vcfg, enc, ti, exec_frames=EXEC, project=PROJECT)
-        lang = task.task.language
-        if cat == "Language Instructions": policy.tx = A.embed_text([lang])
-        policy.seed_base = (1000003 * ti + 10007 * pid + 7 * SEED) if A.SEED_SAMPLER else None
-        out = A.run_episode(task, policy, 0, max_steps=MAX_STEPS[suite]); task.close()
+            log(f"  {name}: FAILED ({type(ex).__name__}: {str(ex)[:120]})")
+            records.append(dict(suite=suite, category=cat, level=level, name=name, task=ti, plus_id=pid,
+                                error=f"{type(ex).__name__}: {str(ex)[:300]}", success=False, steps=0))
+            try:
+                if task is not None: task.close()
+            except Exception: pass
+            continue
+        task.close()
+        # Each variant needs its own MuJoCo env (different BDDL), and 210 creations in one process exhausted the
+        # node's file descriptors ("Errno 23 Too many open files in system"), killing two array tasks an hour in.
+        # Collecting after every close bounds the leak; PLUS_CATS also lets a run be split one category per task.
+        gc.collect()
         rec = dict(suite=suite, category=cat, level=level, name=name, task=ti, plus_id=pid, language=lang, success=bool(out["success"]), steps=int(out["steps"]), secs=round(time.time() - t0, 1))
         records.append(rec); n_done += 1
         log(f"  {suite:14s} {cat[:8]:8s} L{level} t{ti:2d} {'ok  ' if rec['success'] else 'fail'} {rec['steps']:3d} steps  {name[-60:]}  ({rec['secs']}s)")

@@ -9,6 +9,17 @@ run could not: one suite, one seed, open loop only, teacher-forced perception, n
 **Two V100 16 GB, ~40 GPU-hours total, ~20 h wall-clock if both GPUs are used throughout.** The decision gate
 (`gate` mode) costs ~5 GPU-hours and tells you whether the other 35 are worth spending.
 
+> ### Current status
+> This file is the original setup and run guide. For **where the project actually stands** — results, what worked,
+> what did not, the measured ceilings and the open questions — read **[docs/PROGRESS.md](docs/PROGRESS.md)**.
+>
+> Short version as of 1 Oct 2026: four-suite LIBERO success **0.220 → 0.674**, with libero_spatial at **0.955**
+> (ahead of MINERVA's 0.944, against OpenVLA-OFT's 0.976). The remaining gap is almost entirely the object suite
+> (0.485 vs 0.984) and the long-horizon suite. On the LIBERO-plus robustness benchmark the clean-benchmark ranking
+> **inverts**: the configuration that led on standard LIBERO scores worst under perturbation.
+>
+> Operational notes for the cluster are in **[docs/CLUSTER.md](docs/CLUSTER.md)**.
+
 ---
 
 ## Install

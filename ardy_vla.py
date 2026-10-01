@@ -49,10 +49,12 @@ TEXT_MODEL = "t5-base"
 POOL = int(os.environ.get("POOL", 4))        # vision tokens per camera = 1 + POOL*POOL
 IMG_RES, FPS, FLIP_180 = 224, 20, True
 VIS_SUFFIX = os.environ.get("VIS_SUFFIX", "")  # "_p8" selects the finer-pooled feature files
+VIS_CKPT = os.environ.get("VIS_CKPT", "")      # adapted encoder weights (vis_ft.py); REQUIRED with VIS_SUFFIX=_ft
 VIS_MODE = os.environ.get("VIS_MODE", "feat")  # feat = frozen DINOv2 | cnn = trained encoder | both = concatenated
 CNN_W = int(os.environ.get("CNN_W", 64))       # base width of the trained encoder
 CNN_KP = int(os.environ.get("CNN_KP", 32))     # spatial-softmax keypoints
 CNN_SHIFT = int(os.environ.get("CNN_SHIFT", 8))  # random shift augmentation, px (0 at eval)
+CNN_JITTER = float(os.environ.get("CNN_JITTER", 0.0))  # >0: brightness/contrast/colour jitter on the pixel path
 N_OBS = int(os.environ.get("N_OBS", 1))          # observation frames per replan (2 lets the model SEE change)
 LONG_W = float(os.environ.get("LONG_W", 1.0))    # oversampling weight for libero_10 episodes (MINERVA uses 3x)
 MEM_K = int(os.environ.get("MEM_K", 0))          # >0: recurrent visual memory over MEM_K past frames
@@ -60,7 +62,9 @@ MEM_DT = int(os.environ.get("MEM_DT", 40))       # spacing between them, frames 
 MEM_WM = int(os.environ.get("MEM_WM", 0))        # 1: the memory token is an action-conditioned forward model over the H history patches
 WM_CKPT = os.environ.get("WM_CKPT", "")          # pretrained forward model (world_model.py) to initialise it from
 WM_FREEZE = int(os.environ.get("WM_FREEZE", 0))  # 1: keep its recurrent core frozen during policy training
-CAM_MASK = os.environ.get("CAM_MASK", "")        # "wrist" | "agentview": blind that camera (zeros in), train and test
+CAM_MASK = os.environ.get("CAM_MASK", "")
+                                                 # "wrist" | "agentview": blind that camera (zeros in), train and test
+MEM_CAM = 1 if CAM_MASK == "agentview" else 0    # the memory token reads whichever camera is still there
 W_DCT = float(os.environ.get("W_DCT", 0.0))      # >0: frequency-WEIGHTED DCT loss on the explicit trajectory. With
                                                  # uniform weights this equals the plain MSE (Parseval), so it is
                                                  # only meaningful with the low-pass weighting below
@@ -106,6 +110,19 @@ PROJECT_BODY_STEPS, PROJECT_BODY_LAM = 30, 0.05
 # ---- Stage 0/1/2 knobs. Every one defaults to the behaviour that produced the 0.22 baseline, so an
 # unset environment reproduces it exactly; the overnight chain turns them on one stage at a time.
 PROJECT_MODE = os.environ.get("PROJECT_MODE", "adam")            # adam (30-step, 235 ms) | gn (damped Gauss-Newton)
+EXEC_SRC = os.environ.get("EXEC_SRC", "latent")   # latent | explicit: what the executed joints are solved from
+EXEC_ADAPT = int(os.environ.get("EXEC_ADAPT", 0))   # 1: EXEC is a MAXIMUM stride, cut short at gripper transitions
+ADAPT_MIN = int(os.environ.get("ADAPT_MIN", 4))     # never execute fewer frames than this
+ADAPT_FREE = int(os.environ.get("ADAPT_FREE", 8))   # stride when the window commands no gripper change
+ADAPT_AFTER = int(os.environ.get("ADAPT_AFTER", 16))  # frames to hold a gripper change for -- the hand needs time
+ENT_ADAPT = int(os.environ.get("ENT_ADAPT", 0))     # 1: AAC-style entropy-triggered stride (Liang et al., CVPR 2026)
+ENT_N = int(os.environ.get("ENT_N", 8))             # candidate chunks sampled in parallel to estimate the entropy curve
+ENT_MIN = int(os.environ.get("ENT_MIN", 4))         # floor on the entropy-chosen stride
+ENT_MODE = os.environ.get("ENT_MODE", "argmax")     # argmax (steepest rise) | thresh (commit while spread < ENT_TOL)
+W_GRASP = float(os.environ.get("W_GRASP", 0.0))     # >0: auxiliary head predicting the NEXT grasp point (PRISM/AimBot-style)
+L1_HEAD = int(os.environ.get("L1_HEAD", 0))         # 1: one-pass L1 regression instead of DDIM (MINERVA: flow matching buys nothing)
+ENT_TOL = float(os.environ.get("ENT_TOL", 2.0))     # thresh mode: across-sample positional spread, cm
+GRIP_COMMIT = int(os.environ.get("GRIP_COMMIT", 0))  # 1: advance the gripper state machine only over EXECUTED frames
 PROJECT_GN_ITERS = int(os.environ.get("PROJECT_GN_ITERS", 3))
 PROJECT_GN_LAM = float(os.environ.get("PROJECT_GN_LAM", 0.05))
 GRIP_SRC = os.environ.get("GRIP_SRC", "width")                   # width (baseline threshold) | hyst | head | oracle
@@ -420,8 +437,21 @@ def ensure_libero_repo():
     if not LIBERO_DIR.exists():
         subprocess.run(["git", "clone", "--depth", "1", "https://github.com/Lifelong-Robot-Learning/LIBERO", str(LIBERO_DIR)], check=True)
     if str(LIBERO_DIR) not in sys.path: sys.path.insert(0, str(LIBERO_DIR))
-    cfg_dir = Path.home() / ".libero"; cfg_dir.mkdir(exist_ok=True); lib = LIBERO_DIR / "libero" / "libero"
-    (cfg_dir / "config.yaml").write_text(f"benchmark_root: {lib}\nbddl_files: {lib / 'bddl_files'}\ninit_states: {lib / 'init_files'}\ndatasets: {DATA_DIR}\nassets: {lib / 'assets'}\n")
+    lib = LIBERO_DIR / "libero" / "libero"
+    # One config directory PER CHECKOUT, not the single global ~/.libero. Two reasons, both of which bit us:
+    #   * get_libero_path re-reads this file on every env creation, so a LIBERO-plus job running beside a plain
+    #     LIBERO job would silently pick up whichever checkout wrote last -- wrong bddl files, and no error.
+    #   * array tasks start together, and a half-written file yaml-loads as None ("'NoneType' object is not
+    #     iterable"), which killed all four tasks of an array 20 s in.
+    # libero reads LIBERO_CONFIG_PATH when it is imported, so this has to run before `import libero` -- it does.
+    cfg_dir = Path(os.environ["LIBERO_CONFIG_PATH"]) if os.environ.get("LIBERO_CONFIG_PATH") else \
+        Path.home() / (".libero_" + re.sub(r"[^A-Za-z0-9]+", "_", str(LIBERO_DIR)).strip("_")[-50:])
+    cfg_dir.mkdir(parents=True, exist_ok=True); os.environ["LIBERO_CONFIG_PATH"] = str(cfg_dir)
+    text = (f"benchmark_root: {lib}\nbddl_files: {lib / 'bddl_files'}\ninit_states: {lib / 'init_files'}\n"
+            f"datasets: {DATA_DIR}\nassets: {lib / 'assets'}\n")
+    dst = cfg_dir / "config.yaml"
+    if not dst.exists() or dst.read_text() != text:        # atomic: never leave a torn file for a sibling job
+        tmp = cfg_dir / f"config.yaml.{os.getpid()}.tmp"; tmp.write_text(text); os.replace(tmp, dst)
 
 
 # ============================================================================ tokenizer
@@ -526,6 +556,22 @@ def load_data(vision=True):
     # the demo gripper COMMAND (+1 close / -1 open), on the padded grid. It has always been in proprio.npz and
     # was never learned: the policy re-derives open/close from a predicted finger width instead.
     D.grip_pad = torch.from_numpy((pr["actions"][:, -1] > 0).astype(np.float32)[orig_idx]).to(DEVICE)
+    if W_GRASP > 0:
+        # For every frame, the EE position at the NEXT close-command onset in the same episode: the point the
+        # hand is on its way to. Normalised exactly like the explicit stream, so the head's output is comparable.
+        gcmd = (pr["actions"][:, -1] > 0).astype(np.int8)[orig_idx]
+        gpos = exp_frame[orig_idx][:, :3]
+        nxt = np.full(len(gcmd), -1, np.int64)
+        for e in range(D.E):
+            a, n = int(D.pf_start[e]), int(D.pf_len[e])
+            ge = gcmd[a:a + n]
+            tr = np.where((ge[1:] == 1) & (ge[:-1] == 0))[0] + 1          # close onsets within this episode
+            if not len(tr): continue
+            j = np.searchsorted(tr, np.arange(n)); ok = j < len(tr)
+            seg = nxt[a:a + n]; seg[ok] = a + tr[j[ok]]; nxt[a:a + n] = seg
+        D.grasp_tgt = torch.from_numpy(gpos[np.clip(nxt, 0, None)].astype(np.float32)).to(DEVICE)
+        D.grasp_valid = torch.from_numpy((nxt >= 0).astype(np.float32)).to(DEVICE)
+        log(f"grasp-point targets: {100 * float((nxt >= 0).mean()):.0f}% of frames have a future grasp")
     # per-dimension weights for the decoded-body loss: velocities are never executed, so they should not
     # compete with joint positions for capacity (the tokenizer itself weights them 0.3).
     D.body_w = torch.ones(2 * D.NJ, device=DEVICE); D.body_w[D.NJ:] = BODY_VEL_W
@@ -692,7 +738,8 @@ def make_batch(D, eps, B, win_starts=None, hist_len=None, goals="random", pertur
         idx = D.orig_idx_t[torch.clamp(base[:, None] - offs[None], min=0)]
         st = D.ep_start_t[D.ep_task_t[e]] if False else torch.as_tensor(D.ep_start, device=DEVICE)[e]
         idx = torch.maximum(idx, st[:, None]).cpu()
-        vm = D.vis_a[idx.reshape(-1)].to(DEVICE, non_blocking=True)          # (B*K, NT, DV)
+        src = D.vis_w if MEM_CAM == 1 else D.vis_a       # never the camera CAM_MASK removes: see Policy.plan
+        vm = src[idx.reshape(-1)].to(DEVICE, non_blocking=True)               # (B*K, NT, DV)
         vmem = vm.float().mean(1).reshape(B, MEM_K, -1)                      # one vector per frame
     if N_OBS > 1 and D.vis_a is not None:
         # the history tokens are proprioceptive, so nothing in them says an object has already been moved.
@@ -700,6 +747,8 @@ def make_batch(D, eps, B, win_starts=None, hist_len=None, goals="random", pertur
         f_prev = D.orig_idx_t[torch.clamp(D.pf_start_t[e] + w * P - VIS_FRAME_OFFSET - OBS_DT, min=0)].cpu()
         f_prev = torch.maximum(f_prev, torch.as_tensor(D.ep_start)[D.ep_task_t[e].cpu()])
         va2 = D.vis_a[f_prev].to(DEVICE, non_blocking=True); vw2 = D.vis_w[f_prev].to(DEVICE, non_blocking=True)
+        if CAM_MASK == "wrist": vw2 = torch.zeros_like(vw2)          # the ablation has to reach the earlier frame too
+        if CAM_MASK == "agentview": va2 = torch.zeros_like(va2)
     else:
         va2 = vw2 = None
     ra = D.raw_a[f0c].to(DEVICE, non_blocking=True) if getattr(D, "raw_a", None) is not None and VIS_MODE == "both" else None
@@ -708,6 +757,8 @@ def make_batch(D, eps, B, win_starts=None, hist_len=None, goals="random", pertur
              g_val=torch.zeros(B, MAX_GOALS, D.EXP_F, device=DEVICE), g_mask=torch.zeros(B, MAX_GOALS, D.EXP_F, device=DEVICE),
              g_t=torch.zeros(B, MAX_GOALS, dtype=torch.long, device=DEVICE), g_pad=torch.ones(B, MAX_GOALS, dtype=torch.bool, device=DEVICE), g_win=torch.zeros(B, C, D.EXP, device=DEVICE),
              grip_tgt=D.grip_pad[fr], ra=ra, rw=rw, va2=va2, vw2=vw2, vmem=vmem)
+    if W_GRASP > 0:
+        b["grasp_tgt"], b["grasp_valid"] = D.grasp_tgt[fr[:, 0]], D.grasp_valid[fr[:, 0]]
     if goals == "random":
         # GOAL_FREE_FRAC of the batch gets no goal at all: the std evaluation the success number comes from is
         # entirely goal-free, and at the default Uniform{0..3} only a quarter of training looked like it.
@@ -851,6 +902,14 @@ class VisionCNN(nn.Module):
         the frozen path used, so nothing downstream changes shape."""
         x = u8.permute(0, 3, 1, 2).float().div_(255.0)
         if FLIP_180: x = torch.flip(x, dims=(2, 3))
+        if CNN_JITTER > 0 and self.training:
+            # Brightness, contrast and a per-channel gain. LIBERO-plus scores 0.00 on background texture for
+            # every model we have, and nothing in this pipeline ever sees a photometric change during training.
+            b = 1 + CNN_JITTER * (2 * torch.rand(x.shape[0], 1, 1, 1, device=x.device) - 1)
+            g = 1 + CNN_JITTER * (2 * torch.rand(x.shape[0], 3, 1, 1, device=x.device) - 1)
+            m = x.mean(dim=(1, 2, 3), keepdim=True)
+            x = ((x - m) * b + m) * g
+            x = x.clamp_(0, 1)
         if shift > 0:                                          # random translation, the augmentation the
             x = F.pad(x, (shift,) * 4, mode="replicate")        # precomputed-feature pipeline could not do
             i, j = torch.randint(0, 2 * shift + 1, (2,))
@@ -902,6 +961,12 @@ class HybridDenoiser(nn.Module):
         # auxiliary head: the gripper COMMAND (what the demos actually send) per executed frame, as logits.
         # It sits outside the diffused token, so the hybrid layout, the goal tokens and every checkpoint stay valid.
         self.out_grip = nn.Linear(d, P) if (W_GRIP if w_grip is None else w_grip) > 0 else None
+        # Auxiliary spatial target: the EE position at the NEXT gripper close. Our object suite is stuck at
+        # 0.485-0.585 after attacking the representation five ways (CNN, 8x8 pooling, 2- and 4-block encoder
+        # adaptation, augmentation); the literature fixes high-precision tasks with explicit spatial supervision
+        # instead (PRISM 5.0->13.4 on ToolHang, AimBot). This forces the conditioning tokens to encode WHERE the
+        # grasp will happen, rather than hoping a better backbone does it implicitly.
+        self.out_grasp = nn.Linear(d, 3) if W_GRASP > 0 else None
         self.EXP = D.EXP
 
     def cond_tokens(self, b, drop):
@@ -955,7 +1020,9 @@ class HybridDenoiser(nn.Module):
             L_hat = self._run(self.tf2, self.out2, self.in2(torch.cat([x_t[..., self.EXP:], E_hat], -1)), temb, cond, cpad)
             out = torch.cat([E_hat, L_hat], -1)
         if not want_grip: return out
-        return out, (self.out_grip(h1) if self.out_grip is not None else None)
+        aux = dict(grip=self.out_grip(h1) if self.out_grip is not None else None,
+                   grasp=self.out_grasp(h1.mean(1)) if self.out_grasp is not None else None)
+        return out, aux
 
 
 def ckpt_path(variant, seed): return CKPT_DIR / f"{variant}_s{seed}.pt"
@@ -973,7 +1040,7 @@ def load_compat(model, sd):
             n = min(sd[k].shape[0], tgt[k].shape[0])
             merged = tgt[k].clone(); merged[:n] = sd[k][:n].to(merged.dtype); sd = dict(sd); sd[k] = merged
     missing, unexpected = model.load_state_dict(sd, strict=False)
-    missing = [m for m in missing if not m.startswith(("vis_mem.", "cnn_proj.", "obs_emb."))]
+    missing = [m for m in missing if not m.startswith(("vis_mem.", "cnn_proj.", "obs_emb.", "out_grasp."))]
     if missing or unexpected:
         raise RuntimeError(f"checkpoint does not match the model: missing {missing}, unexpected {unexpected}")
     return model
@@ -1008,6 +1075,54 @@ def dct_loss(E_hat, E, tau=DCT_TAU):
 def q_sample(x0, t, noise): return AB[t].sqrt()[:, None, None] * x0 + (1 - AB[t]).sqrt()[:, None, None] * noise
 
 
+def tile_batch(b, n):
+    """Repeat a batch-1 conditioning dict n times, so n candidate chunks come from ONE forward pass."""
+    out = {}
+    for k, v in b.items():
+        out[k] = v.expand(n, *v.shape[1:]).contiguous() if (torch.is_tensor(v) and v.shape[0] == 1) else v
+    return out
+
+
+def entropy_stride(D, xN, exec_max):
+    """AAC's rule (Liang et al., CVPR 2026): the stride is where the per-step action entropy rises fastest.
+
+    Their signal is the spread of N candidate chunks at each future step -- low spread means the model agrees
+    that far ahead and the chunk can be committed, high spread means replan. For a continuous action the
+    differential entropy of a Gaussian is log(sigma) up to a constant, so the log of the across-sample positional
+    standard deviation is the entropy curve, and the steepest increase is its maximum first difference."""
+    n = xN.shape[0]
+    ex = xN[:, :, :D.EXP].reshape(n, -1, D.EXP_F)
+    pos = unnorm_pos(D, ex[..., :3].reshape(-1, 3)).reshape(n, -1, 3)
+    sd = pos.std(0).mean(-1) * 100.0                                 # across-sample spread per frame, cm
+    if ENT_MODE == "thresh":
+        # "low spread -> commit, high spread -> replan", read literally. The argmax form below cannot work on a
+        # curve that starts at zero: every candidate chunk begins at the SAME measured state, so log-sigma rises
+        # fastest at the very first frame and the argmax pins the stride to its floor -- measured, stride 5.1 and
+        # 65 replans an episode at N=8, scoring 0.066. More samples sharpen that spike, which is why N=8 was
+        # worse than N=2: a signature of the statistic, not of the policy.
+        over = (sd > ENT_TOL).nonzero()
+        k = int(over[0].item()) if len(over) else sd.shape[0]
+    else:
+        ent = torch.log(sd + 1e-6)
+        k = int(torch.argmax(ent[1:] - ent[:-1]).item()) + 1
+    return max(ENT_MIN, min(exec_max, k)), sd
+
+
+def l1_predict(D, model, b, want_grip=False):
+    """One forward pass at t=0 from a zero window: the L1-regression counterpart of DDIM sampling.
+
+    MINERVA reports flow matching gives no detectable advantage over direct L1 regression across three seeds at
+    3.8x the speed, and our own sampler turns out to be nearly deterministic anyway -- the across-sample
+    positional spread never exceeds 2 cm over a 1.6 s window -- so the stochastic machinery may be pure cost."""
+    with torch.no_grad():
+        cond, cpad = model.cond_tokens(b, drop=False)
+        x0 = torch.zeros_like(b["x0"]); t0 = torch.zeros(x0.shape[0], dtype=torch.long, device=x0.device)
+        out = model(x0, t0, cond, cpad, want_grip=want_grip)
+    if not want_grip: return out
+    x, aux = out
+    return x, (aux["grip"] if isinstance(aux, dict) else aux)
+
+
 def ddim_sample(D, model, b, inpaint=None, guide=None, cfg=1.0, steps=SAMPLE_STEPS, seed=None, want_grip=False):
     """x0-prediction DDIM. inpaint: dict(mask,val) replacing explicit entries of x0_hat (DiSCo-style baseline).
     guide: dict(mask,val) gradient guidance on the explicit goal error through the network (classifier-guidance baseline).
@@ -1036,7 +1151,7 @@ def ddim_sample(D, model, b, inpaint=None, guide=None, cfg=1.0, steps=SAMPLE_STE
         else:
             with torch.no_grad(), torch.autocast(**AMP):
                 out = model(x, t.expand(B), cond, cpad, want_grip=want_grip)
-                x0_hat, grip_logits = (out[0].float(), out[1]) if want_grip else (out.float(), None)
+                x0_hat, grip_logits = (out[0].float(), out[1]["grip"]) if want_grip else (out.float(), None)
                 if use_cfg: x0_u = model(x, t.expand(B), cond, cpad_u).float(); x0_hat = x0_u + cfg * (x0_hat - x0_u)
         with torch.no_grad():
             x0_hat[..., D.EXP:] = x0_hat[..., D.EXP:].clamp(-1, 1)
@@ -1136,7 +1251,15 @@ class OnlineEncoder:
     def __init__(self, meta):
         from transformers import AutoModel
         name = meta["vision_encoder"]; self.kind = "dinov2" if "dinov2" in name else "siglip"
-        m = AutoModel.from_pretrained(name); self.vis = getattr(m, "vision_model", m).to(DEVICE).eval().half()
+        m = AutoModel.from_pretrained(name); self.vis = getattr(m, "vision_model", m).to(DEVICE)
+        if VIS_CKPT:
+            # A policy trained on features from an ADAPTED encoder must be evaluated with that same encoder.
+            # Without this, training reads vision_*_ft.npy while inference re-encodes with the original pretrained
+            # weights -- a total distribution mismatch that scored 0.079 against 0.660, and looked for all the
+            # world like "adapted features hurt the policy" rather than "the evaluator used the wrong encoder".
+            sd = torch.load(VIS_CKPT, map_location="cpu", weights_only=False)["vis"]
+            self.vis.load_state_dict(sd); log(f"OnlineEncoder: adapted weights from {Path(VIS_CKPT).name}")
+        self.vis = self.vis.eval().half()
         MEAN, STD = ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)) if self.kind == "dinov2" else ((0.5,) * 3, (0.5,) * 3)
         self.mean, self.std = [torch.tensor(v, device=DEVICE).view(1, 3, 1, 1).half() for v in (MEAN, STD)]
 
@@ -1165,6 +1288,8 @@ def patch_robosuite():
 
 class LiberoTask:
     """One LIBERO task with a joint-position controller, the standard 50 init states, and the matching demos (for goal sampling)."""
+    controller = "JOINT_POSITION"          # class default so reset() is safe in any subclass that forgets to set it
+
     def __init__(self, D, task_index, camera_res=128, record_cams=()):
         os.environ.setdefault("MUJOCO_GL", "egl"); ensure_libero_repo(); patch_robosuite()
         from libero.libero import benchmark, get_libero_path
@@ -1174,8 +1299,9 @@ class LiberoTask:
         suite = benchmark.get_benchmark_dict()[self.info["suite"]]()
         norm = lambda s: re.sub(r"[^a-z]", "", s.lower()); tid = {norm(suite.get_task(i).language): i for i in range(suite.n_tasks)}[norm(self.info["language"])]
         self.task, self.task_id = suite.get_task(tid), tid; self.init_states = suite.get_task_init_states(tid)
+        self.controller = os.environ.get("CONTROLLER", "JOINT_POSITION")
         self.env = OffScreenRenderEnv(bddl_file_name=os.path.join(get_libero_path("bddl_files"), self.task.problem_folder, self.task.bddl_file),
-                                      camera_heights=camera_res, camera_widths=camera_res, controller="JOINT_POSITION")
+                                      camera_heights=camera_res, camera_widths=camera_res, controller=self.controller)
         self.env.seed(0); self.record_cams = list(record_cams); self.res = camera_res
         eps = np.where(D.ep_task == task_index)[0]; self.episodes = eps           # demo k <-> init state k (LIBERO collected one demo per init state)
         self.h5 = None
@@ -1185,16 +1311,31 @@ class LiberoTask:
                 except Exception: lang = Path(p).stem.replace("_demo", "").replace("_", " ")
             if re.sub(r"[^a-z]", "", lang.lower()) == re.sub(r"[^a-z]", "", self.info["language"].lower()): self.h5 = p; break
 
-    def reset(self, init_idx):
+    def reset(self, init_idx, settle=True):
         self.env.reset()
         try: self.env.set_init_state(self.init_states[init_idx])
         except Exception as ex: log(f"set_init_state failed ({ex}); using env.reset() placement")
         self._post_set_state()
         robot = self.env.env.robots[0]; ctrl = robot.controller
-        ctrl.output_max = np.full(7, 0.15); ctrl.output_min = np.full(7, -0.15); ctrl.action_scale = None; ctrl.kp = np.full(7, float(os.environ.get("JP_KP", 150)))
-        ctrl.kd = 2 * np.sqrt(ctrl.kp) * ctrl.damping_ratio if hasattr(ctrl, "damping_ratio") else ctrl.kd
-        for _ in range(5): obs, *_ = self.env.step(np.zeros(8))
+        if self.controller == "JOINT_POSITION":
+            ctrl.output_max = np.full(7, 0.15); ctrl.output_min = np.full(7, -0.15); ctrl.action_scale = None; ctrl.kp = np.full(7, float(os.environ.get("JP_KP", 150)))
+            ctrl.kd = 2 * np.sqrt(ctrl.kp) * ctrl.damping_ratio if hasattr(ctrl, "damping_ratio") else ctrl.kd
+        # OSC keeps robosuite's own defaults: the demos were teleoperated through exactly this controller, so
+        # retuning it would measure our tuning rather than the actuation path the demonstrations assume.
+        ndof = 7 if self.controller == "JOINT_POSITION" else 6
+        # settle=False reproduces LIBERO's own replay, which applies the first action immediately after
+        # set_init_state. The 5 zero-action steps below are 0.25 s during which the arm sags and objects drift,
+        # which desynchronises any replay of a recorded action sequence from its recorded state.
+        obs = self.env.env._get_observations() if not settle else None
+        for _ in range(5 if settle else 0): obs, *_ = self.env.step(np.zeros(ndof + 1))
         self.robot = robot; return obs
+
+    def step_raw(self, action):
+        """One env step with an action already in the controller's own space (7 for OSC pose+gripper, 8 for joints)."""
+        obs, rew, done, info = self.env.step(np.asarray(action, np.float64))
+        try: succ = bool(self.env.check_success())
+        except Exception: succ = bool(done)
+        return obs, succ, info
 
     def _post_set_state(self):
         """Hook run after the saved init state is loaded, before the arm settles. A no-op here; PlusTask uses it."""
@@ -1230,8 +1371,9 @@ class PlusTask(LiberoTask):
         from libero.libero.envs import OffScreenRenderEnv
         self.D, self.info = D, D.meta["tasks"][task_index]; self.task_index = task_index
         self.task, self.task_id = bench.get_task(plus_id), plus_id; self.init_states = np.asarray(bench.get_task_init_states(plus_id))
+        self.controller = os.environ.get("CONTROLLER", "JOINT_POSITION")
         self.env = OffScreenRenderEnv(bddl_file_name=os.path.join(get_libero_path("bddl_files"), self.task.problem_folder, self.task.bddl_file),
-                                      camera_heights=camera_res, camera_widths=camera_res, controller="JOINT_POSITION")
+                                      camera_heights=camera_res, camera_widths=camera_res, controller=self.controller)
         self.env.seed(0); self.record_cams = list(record_cams); self.res = camera_res
         self.episodes = np.where(D.ep_task == task_index)[0]; self.h5 = None
 
@@ -1267,6 +1409,8 @@ class Policy:
         self.q_hist, self.g_hist, self.pending, self.t = [], [], [], 0
         self.n_plans = 0; self.ens = []       # ensembling buffer: (start_frame, q (C*P,7), width (C*P,))
         self.grip_state = False; self.grip_hold = 0
+        self.last_grip_change = -10 ** 6; self.strides = []; self.last_cmd = None   # adaptive stride bookkeeping
+        self._grip_traj = None; self.ent_stride = self.exec
         self.obs_buf = []                      # past vision tokens, for N_OBS > 1
 
     def observe(self, obs):
@@ -1281,7 +1425,7 @@ class Policy:
         hyst   : hysteresis + latch, so a close survives the controller's ~0.16 s lag instead of chattering.
         oracle : the demo's own command (Stage 0 ablation -- an upper bound, not a policy).
         head   : the trained BCE command head (Stage 2); 'width' carries its probability in that mode."""
-        D = self.D; n = len(width)
+        D = self.D; n = len(width); st0, hold0 = self.grip_state, self.grip_hold
         if GRIP_SRC == "oracle" and self.demo_grip is not None:
             idx = np.clip(self.t + np.arange(n), 0, len(self.demo_grip) - 1)
             return self.demo_grip[idx].astype(bool)
@@ -1295,6 +1439,7 @@ class Policy:
         else:
             return width < D.gripper_threshold
         out = np.zeros(n, bool)
+        traj = []                 # (state, hold) after each planned frame, so only the executed prefix commits
         gated = True
         if GRIP_GATE_CM > 0 and len(self.q_hist) and ee_plan is not None:
             q_now = torch.from_numpy(self.q_hist[-1])[None].to(DEVICE)
@@ -1312,7 +1457,20 @@ class Policy:
                 if new and not self.grip_state and not gated: new = False      # wait for the arm to arrive
                 if new != self.grip_state: self.grip_state = new; self.grip_hold = GRIP_LATCH
             out[k] = self.grip_state
+            traj.append((self.grip_state, self.grip_hold))
+        if GRIP_COMMIT:
+            # The window is C*P frames but only `stride` of them are executed. Committing all of them runs the
+            # latch and the open/close state ahead of the arm, so the next plan starts from a state the robot is
+            # not in. Keep the sequence, roll the state back, and let run_episode commit exactly what it ran.
+            self.grip_state, self.grip_hold = st0, hold0
+            self._grip_traj = traj
         return out
+
+    def commit_grip(self, n):
+        """Advance the gripper state machine over exactly the n frames that were executed."""
+        if not GRIP_COMMIT or not getattr(self, "_grip_traj", None): return
+        self.grip_state, self.grip_hold = self._grip_traj[min(n, len(self._grip_traj)) - 1]
+        self._grip_traj = None
 
     def _ensemble(self, q, width, start):
         """ACT-style temporal ensembling: average the overlapping frames of the last K plans, weighting a plan by
@@ -1328,6 +1486,38 @@ class Policy:
             acc_q[:m] += wt * qq[off:off + m]; acc_w[:m] += wt * ww[off:off + m]; wsum[:m] += wt
         wsum = np.maximum(wsum, 1e-6)
         return acc_q / wsum[:, None], acc_w / wsum
+
+    def stride(self, g_plan):
+        """How many of the planned frames to execute before replanning. EXEC when fixed; adaptive otherwise.
+
+        Long in free space is NOT what this does, and the first version of it -- which cut the stride short at a
+        gripper transition to "replan with the contact in view" -- scored 0.000. The trace says why: a grasp needs
+        a SUSTAINED close command, because the fingers take several frames to shut (hence GRIP_LATCH=6). Executing
+        two frames past the transition left the width at 0.074 instead of 0.003, the next plan proposed the same
+        close, and the arm hovered for 22 replans moving under a centimetre each. Fixed stride 32 succeeds on the
+        same episode precisely because it commits to the whole close.
+
+        So: run LONG through a commanded gripper change (k + ADAPT_AFTER frames, enough for the hand to act), and
+        short in free space, where replanning is cheap and reactivity is what helps. That is the reverse of the
+        obvious rule, and it also explains why executing the full chunk helped so much in the first place.
+
+        Tracking error is deliberately NOT a trigger: it measures 2.12 cm in successes and 2.03 cm in failures
+        (closedloop records), so it carries no information about whether this plan is going wrong."""
+        n = len(g_plan)
+        if ENT_ADAPT:
+            s = min(self.ent_stride, n); self.strides.append(s); return s
+        if not EXEC_ADAPT: return min(self.exec, n)
+        # self.grip_state is the state at the END of the planned window (_grip_command walks all C*P frames), so
+        # the reference has to be this plan's own first command, compared with the previous plan's first command.
+        cur = bool(g_plan[0])
+        self.last_cmd = cur
+        k = next((i for i in range(1, n) if bool(g_plan[i]) != cur), n)
+        if k >= n:
+            s = min(self.exec, max(ADAPT_MIN, ADAPT_FREE))               # free space: replan often, stay reactive
+        else:
+            s = int(min(self.exec, max(ADAPT_MIN, k + ADAPT_AFTER)))     # a grasp: hold the command long enough
+        self.strides.append(s)
+        return s
 
     def _history_tokens(self):
         D = self.D
@@ -1375,10 +1565,8 @@ class Policy:
         # encoding them would hand the model DINOv2-of-black -- a constant it never saw in training, which is a
         # different question from "this camera is absent". That mismatch is what produced 0.000 on every one of
         # 700 wrist-masked episodes. In cnn/both mode va IS the pixel tensor, so the same line still matches.
-        if CAM_MASK == "wrist": vw = torch.zeros_like(vw)
-        if CAM_MASK == "agentview": va = torch.zeros_like(va)
         if N_OBS > 1 or MEM_K > 0 or MEM_WM:
-            self.obs_buf.append((va, vw))
+            self.obs_buf.append((va, vw))                    # buffered BEFORE masking; each consumer masks its own
             k = max(0, len(self.obs_buf) - 1 - OBS_DT // max(1, self.exec))
             va2, vw2 = self.obs_buf[k]
         vmem = None
@@ -1391,7 +1579,15 @@ class Policy:
         elif MEM_K > 0 and va.dtype != torch.uint8:
             step = max(1, MEM_DT // max(1, self.exec))
             picks = [max(0, len(self.obs_buf) - 1 - j * step) for j in range(MEM_K - 1, -1, -1)]
-            vmem = torch.stack([self.obs_buf[i][0].float().mean(1)[0] for i in picks])[None]
+            vmem = torch.stack([self.obs_buf[i][MEM_CAM].float().mean(1)[0] for i in picks])[None]
+        # Now mask, and mask every consumer of the camera, not just the current-frame token. VisionMemory reads
+        # agentview, so CAM_MASK=agentview with MEM_K>0 would otherwise feed the memory the very camera it claims
+        # to have removed -- and masking the buffer instead would starve the memory of a camera it saw in
+        # training. MEM_CAM points the memory at whichever camera survives, in make_batch and here alike.
+        if CAM_MASK == "wrist":
+            vw = torch.zeros_like(vw); vw2 = None if vw2 is None else torch.zeros_like(vw2)
+        if CAM_MASK == "agentview":
+            va = torch.zeros_like(va); va2 = None if va2 is None else torch.zeros_like(va2)
         b = dict(x0=torch.zeros(1, C, D.TOK, device=DEVICE), hist=hist, hist_pad=pad, va=va, vw=vw, ra=ra, rw=rw,
                  va2=va2, vw2=vw2, vmem=vmem, tx=self.tx,
                  g_val=torch.zeros(1, MAX_GOALS, D.EXP_F, device=DEVICE), g_mask=torch.zeros(1, MAX_GOALS, D.EXP_F, device=DEVICE),
@@ -1408,8 +1604,20 @@ class Policy:
                 else: guide = dict(mask=mask, val=val)
         seed = None if self.seed_base is None else self.seed_base + 7919 * self.n_plans
         want_grip = GRIP_SRC == "head" and getattr(self.model, "out_grip", None) is not None
-        out = ddim_sample(D, self.model, b, inpaint=inpaint, guide=guide, cfg=cfg, seed=seed, want_grip=want_grip)
-        x, grip_logits = out if want_grip else (out, None)
+        if ENT_ADAPT:
+            # N candidates in ONE batched pass. The cost this experiment measures is exactly that N, against our
+            # gripper trigger, which needs no extra samples at all.
+            outN = ddim_sample(D, self.model, tile_batch(b, ENT_N), inpaint=inpaint, guide=guide, cfg=cfg, seed=seed, want_grip=want_grip)
+            xN, grip_logits = outN if want_grip else (outN, None)
+            self.ent_stride, _ = entropy_stride(D, xN, self.exec)
+            x = xN[:1]
+            if grip_logits is not None: grip_logits = grip_logits[:1]
+        elif L1_HEAD:
+            out = l1_predict(D, self.model, b, want_grip=want_grip)
+            x, grip_logits = out if want_grip else (out, None)
+        else:
+            out = ddim_sample(D, self.model, b, inpaint=inpaint, guide=guide, cfg=cfg, seed=seed, want_grip=want_grip)
+            x, grip_logits = out if want_grip else (out, None)
         self.n_plans += 1
         # The FSQ decoder is causal and was trained on whole episodes, but the policy used to hand it the 4
         # predicted patches alone. Measured (s0_probe.json): 0.90 deg with full-episode context, 1.26 with a
@@ -1423,6 +1631,15 @@ class Policy:
         else:
             body = D.tok.decode(lat_w).float()
         ex = x[0, :, :D.EXP].reshape(-1, D.EXP_F)
+        if EXEC_SRC == "explicit":
+            # Solve the executed joints from the EXPLICIT stream alone, seeding the IK at the measured pose so
+            # the FSQ latent enters the execution path not at all. The latent is the lossy half of the hybrid
+            # token: 0.903 deg reconstruction with full context, 6.199 deg decoded as the four isolated patches
+            # the policy actually emits (s0_probe.json) -- about 6 cm at the end effector, on every joint it
+            # executes. The explicit stream is the accurate half (0.49 cm goal adherence, flat to 3.2 s).
+            if not self.project: raise RuntimeError("EXEC_SRC=explicit needs PROJECT=1: the IK *is* the projection")
+            qn = (torch.as_tensor(self.q_hist[-1], dtype=torch.float32, device=DEVICE) - D.body_mean[:D.NJ]) / D.body_std[:D.NJ]
+            body = qn[None, None].expand(1, C * P, D.NJ).contiguous()
         q = project_body(D, body, ex[None]) if self.project else (body[..., :D.NJ] * D.body_std[:D.NJ] + D.body_mean[:D.NJ])
         q = q[0].cpu().numpy()
         if grip_logits is not None:
@@ -1445,10 +1662,11 @@ def run_episode(task, policy, init_idx, goal_fn=None, max_steps=500, perturb_fn=
         goal = goal_fn(t) if goal_fn else None
         policy.t = t                                                   # the policy needs the absolute frame for ensembling / oracle gripper
         q_plan, g_plan, ee_plan = policy.plan(goal); plans.append((t, ee_plan))
+        n_exec = policy.stride(g_plan)
         fkp, _ = fk_with(task.D.fk_params, torch.from_numpy(np.asarray(q_plan, np.float32)).to(DEVICE))
         plan_fk.append(fkp.cpu().numpy())                              # FK of the planned joints: separates stream
         plan_q.append(np.asarray(q_plan, np.float32))                  # inconsistency from controller lag
-        for k in range(policy.exec):
+        for k in range(n_exec):
             if perturb_fn: perturb_fn(task, t)
             obs, done, _ = task.step_to(q_plan[k], bool(g_plan[k])); policy.observe(obs)
             pos, _ = fk_with(task.D.fk_params, torch.from_numpy(np.asarray(obs["robot0_joint_pos"], np.float32))[None].to(DEVICE)); ee.append(pos[0].cpu().numpy())
@@ -1458,5 +1676,7 @@ def run_episode(task, policy, init_idx, goal_fn=None, max_steps=500, perturb_fn=
             t += 1
             if done: success = True; break
             if t >= max_steps: break
+        policy.commit_grip(k + 1)                                      # only what actually ran changes the state
     return dict(success=success, steps=t, ee_path=np.array(ee), grip=np.array(grip), plans=plans, frames=frames,
-                plan_fk=np.array(plan_fk), plan_q=np.array(plan_q))
+                plan_fk=np.array(plan_fk), plan_q=np.array(plan_q), n_plans=len(plans),
+                mean_stride=float(np.mean(policy.strides)) if policy.strides else float(policy.exec))
